@@ -156,8 +156,10 @@ Staff can submit requests in a Google Sheet and receive results in a separate ta
 The worker matches each source URL to an approved inventory entry. It does not
 infer publication permission from a submitted link.
 
-Follow [Google Sheets setup](docs/google-sheets-queue.md) to configure credentials,
-tabs, and source mappings. Then run:
+See [Google Sheets setup and field guide](docs/google-sheets-queue.md) for creating
+the spreadsheet, every Requests and Results field, status meanings, and staff
+submission/retry instructions. It also covers credentials and approved source mappings.
+Then run:
 
 ```sh
 python3 -m scripts.manifest_worker.sheets \
