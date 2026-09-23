@@ -9,7 +9,7 @@ per page. The destination image service and manifest host are configurable.
 
 ## Requirements
 
-- Python 3.11 or newer on macOS or Linux. No additional Python packages are required.
+- Python 3.11 or newer on macOS or Linux. The CSV command needs no additional Python packages; Sheets dependencies are optional.
 - HTTPS access to the source and destination image services.
 - For publication, filesystem write access to the directory serving the manifests.
 
@@ -149,3 +149,22 @@ directory for all runs targeting the same publication directory.
 
 See the [operator runbook](scripts/manifest_worker/README.md) for limits, recovery,
 permissions, and TLS troubleshooting.
+
+## Google Sheets
+
+Staff can submit requests in a Google Sheet and receive results in a separate tab.
+The worker matches each source URL to an approved inventory entry. It does not
+infer publication permission from a submitted link.
+
+Follow [Google Sheets setup](docs/google-sheets-queue.md) to configure credentials,
+tabs, and source mappings. Then run:
+
+```sh
+python3 -m scripts.manifest_worker.sheets \
+  --config work/config.json \
+  --sheet YOUR_SPREADSHEET_ID
+```
+
+This defaults to a local dry run, but writes its outcome to the Results tab.
+Completed requests are skipped on subsequent runs. Add `--publish` only when
+running on the configured manifest publication host.

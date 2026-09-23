@@ -1,72 +1,121 @@
-# Google Sheets staff queue — proposed
+# Google Sheets setup
 
-Status: design only. The existing worker reads CSV jobs and an operator-approved
-inventory. A Sheets adapter and node/record-resolution intake stage must be built.
-Use a Google Sheet, not a free-form Google Doc: one row represents one request.
-Google's API supports reading cells and writing results back:
-https://developers.google.com/workspace/sheets/api/guides/values
+The Sheets command reads staff requests, matches them to the operator's approved
+inventory, runs the converter, and appends outcomes to a separate Results tab.
+It leaves the Requests tab unchanged. Default mode validates and stages manifests
+locally; it does not publish or update ArchivesSpace records.
 
-## Staff workflow
+## 1. Install dependencies
 
-1. Add an ArchivesSpace or Compass link and optional notes to a Requests sheet.
-2. Mark the request Ready when complete.
-3. A scheduled server worker resolves its identity, checks inclusion approval and
-   processes the manifest using the existing converter.
-4. Results show Validated (dry run), Published (verified upload), Needs review or
-   Failed, with the manifest URL and a useful explanation.
-5. Staff correct failed requests and explicitly request retry; prior results remain
-   in the audit log. No terminal or Python installation is needed for staff.
+From the repository directory:
 
-Adding a row is submission, not content-access approval. Publication still uses the
-operator-approved policy/inventory. Automatically updating ArchivesSpace File Versions
-is a separate opt-in workflow, not implied by Published.
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements-sheets.txt
+```
 
-## Columns
+Complete the configuration and inventory setup in the root README first.
+Use absolute paths in the configuration. A dry-run configuration may omit
+`publish_dir` entirely.
 
-| Column | Editor | Purpose |
-| --- | --- | --- |
-| Request ID | Intake automation | Stable unique ID, independent of row order |
-| Record/source URL | Staff | ArchivesSpace or Compass item |
-| Notes | Staff | Context for review |
-| Ready / Retry | Staff | Explicit submission state |
-| Status | Worker | Queued, Processing, Validated, Published, Needs review, Failed |
-| Manifest URL | Worker | Canonical URL; label proposed versus published |
-| Last attempt | Worker | Timestamp |
-| Result | Worker | Short actionable explanation |
+## 2. Configure Google access
 
-Prefer separate Requests and Results tabs, with the Results tab protected against
-routine edits. Staff can continuously append requests. Use filter views instead of
-sorting the underlying queue while the worker runs. Durable receipts on the server
-remain authoritative; the Sheet is a submission/status interface, not a transaction log.
+1. In Google Cloud, select or create a project and enable the Google Sheets API.
+2. Create a dedicated service account and a JSON key, subject to your organization's policy.
+3. Store the key outside the repository on the worker machine. Restrict its permissions.
+4. Share the spreadsheet with the service account's email address as an Editor.
 
-## Adapter requirements
+```sh
+chmod 600 /absolute/private/path/google-service-account.json
+export GOOGLE_APPLICATION_CREDENTIALS=/absolute/private/path/google-service-account.json
+```
 
-- Use a dedicated authorized Google identity with access to the specific spreadsheet.
-  Confirm Smith Workspace sharing/service-account policy. No credentials in the Sheet,
-  repository or staff laptops; configure secrets on the worker host.
-- Poll at an agreed interval (for example five minutes), in bounded batches. One
-  active worker holds the local lock. A Sheet status cell is not a distributed lock.
-- Identify work by immutable request ID plus an input fingerprint, never row number
-  alone. Detect duplicate IDs, changed input, row deletion and reordering. A robust
-  Results tab keyed by request ID avoids overwriting shifted request rows.
-- Persist claim, source mapping, approval and results in durable local receipts.
-  If upload succeeds but the Google update fails, retry the status write without
-  republishing. Reconcile status from receipts after restarts; do not lose requests.
-- Use RAW cell writes so source text is not interpreted as spreadsheet formulas.
-  Do not overwrite staff-entered fields. Back off on API quotas and outages.
-- Recheck authorization/withdrawals before publication or retries. Restricted and
-  unknown-access requests must not become public through the Sheet.
-- A self-entered submitter field is not verified identity. Use organizational audit
-  facilities or authenticated intake if person-level attribution is required.
-- Before retirement, resolve through retained Drupal mappings first, with bounded
-  Compass HTTP fallback. An ArchivesSpace URL is not accepted by the existing worker
-  directly: intake must establish the correct digital object, PID and node mapping.
-- Distinguish publication, ArchivesSpace update and OCR indexing states. Missing OCR
-  is not an error in image-manifest conversion unless that stage explicitly requires it.
+Do not commit the key or paste its contents into the spreadsheet. Rotate keys using
+your organization's policy. The spreadsheet ID is the portion of its URL between
+`/d/` and `/edit`. The command also accepts the full spreadsheet URL.
 
-## Setup decisions
+## 3. Prepare Requests
 
-Confirm the spreadsheet owner/URL, request editors, Google authentication method,
-execution host, polling interval, access-approval owner and failure notifications.
-Start with read/write status in dry-run mode, then enable publication after hosted
-verification. No live spreadsheet or Google credentials have been configured yet.
+Create a tab named `Requests` with these exact headers in A1:D1:
+
+| Request ID | Source URL | Notes | Ready |
+| --- | --- | --- | --- |
+| request-001 | https://archives.example.org/repositories/2/archival_objects/123 | Optional notes | TRUE |
+
+Use unique, stable request IDs containing letters, numbers, underscores or hyphens.
+Enter `TRUE` to submit, or `FALSE`/blank to hold. A checkbox also works.
+Keep at most 1,000 request rows. Use `--requests-tab NAME` for a different tab name.
+
+## 4. Map sources to approved items
+
+Add `source_urls` to the corresponding item in the operator-maintained inventory:
+
+```json
+"source_urls": [
+  "https://archives.example.org/repositories/2/archival_objects/123"
+]
+```
+
+The item still needs the source manifest/node information and access approval
+described in the README. The command also recognizes the inventory's `original_uri`
+and Compass node/manifest URLs derived from its node ID. Source URLs must use HTTPS
+and have no query parameters. Unknown, ambiguous, unapproved or withdrawn items
+receive `Needs review`. Adding a Sheet row does not establish an identity mapping
+or grant publication approval. General automatic record resolution is not included.
+
+## 5. Initialize and run locally
+
+```sh
+python3 -m scripts.manifest_worker.sheets \
+  --config work/config.json \
+  --sheet YOUR_SPREADSHEET_ID \
+  --initialize-results
+```
+
+This creates or extends a separate `Results` tab and processes up to ten ready
+requests. Existing recognized result columns are preserved. Results contain request
+ID, source URL, status, manifest URL, timestamp, explanation and a hidden Operation
+ID. An existing Error column is supported. Do not edit Operation IDs.
+
+A successful dry run says **Validated (dry run)**. Its manifest URL is proposed,
+not published. Converted files are under `state_dir/artifacts/`. Run the same
+command again without `--initialize-results`: unchanged completed requests should
+be skipped. `--limit N` sets the per-run maximum, from 1 to 100.
+
+On macOS, if your Python installation lacks a working certificate bundle, use your
+system's trusted CA file rather than disabling TLS verification:
+
+```sh
+export SSL_CERT_FILE=/etc/ssl/cert.pem
+export REQUESTS_CA_BUNDLE=/etc/ssl/cert.pem
+```
+
+## Retries and recovery
+
+- Correct the underlying problem, then change Ready to `RETRY:1`. Increment to
+  `RETRY:2`, etc. for further attempts. Setting TRUE repeatedly is not a retry.
+- Changes to request content, mapped approval, configuration or publication mode
+  create a new operation. Avoid casual edits to completed requests.
+- Failed result writes can be retried by rerunning the command. Completed local
+  receipts are reconciled without converting again.
+- Keep the state directory and Results operation IDs. Protect Results against
+  routine staff edits and back up state. Archive Results before 5,000 rows.
+- Exit codes: 0 for a successful run, 1 for newly processed Failed/Needs review
+  outcomes, 2 for setup or transport errors. Previously recorded failures are
+  skipped until explicitly retried; monitor Results as well as exit codes.
+
+## Scheduling and publication
+
+After a successful manual test, schedule the same command with cron using absolute
+paths to the virtualenv Python and configuration. Set credential and certificate
+environment variables explicitly in the scheduled job. Capture output in a private
+log and arrange failure monitoring. Run one worker host with one shared state
+directory; the file lock does not coordinate separate hosts.
+
+Add `--publish` only after configuring and testing the publication directory and
+HTTPS/CORS/cache headers described in the README. Publication writes to a local
+filesystem directory; it does not upload over SFTP. Publishing is a different
+operation from a dry run, so a previously validated request will be processed again.
+No scheduler is installed by these commands. Requests remain staff-editable and
+results are appended as an audit history, not written over the request rows.

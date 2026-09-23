@@ -1,0 +1,2 @@
+# Optional: needed only for the Google Sheets command.
+google-auth[requests]>=2.38,<3
