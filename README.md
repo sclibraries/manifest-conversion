@@ -1,111 +1,151 @@
 # Manifest conversion
 
-Harvest selected Compass IIIF manifests, convert their image services to
-`digital.smith.edu`, validate pages, and publish static manifests on libtools2.
+A Python command-line tool that reads IIIF manifests, rewrites their image-service
+URLs, validates page dimensions, and optionally publishes the converted JSON files
+to a web directory.
 
-**Current status:** CSV batches and folder input work. Google Sheets integration is
-planned. Local tests passed for **Agendas, 1976 (19 pages)**; live libtools2 publication
-and hosted browser acceptance remain to be verified. No automatic ArchivesSpace
-record updates are performed.
+The current converter supports Compass IIIF Presentation 2 manifests with one image
+per page. The destination image service and manifest host are configurable.
 
-## Install and test
+## Requirements
 
-Requires Python 3.11+ on macOS or Linux. No pip packages are required.
+- Python 3.11 or newer on macOS or Linux. No additional Python packages are required.
+- HTTPS access to the source and destination image services.
+- For publication, filesystem write access to the directory serving the manifests.
+
+## Install
 
 ```sh
 git clone https://github.com/sclibraries/manifest-conversion.git
 cd manifest-conversion
-python3 -m unittest scripts.manifest_worker.test_worker
-python3 -m scripts.manifest_worker --help
+mkdir -p work/sources work/incoming
+cp scripts/manifest_worker/examples/config.json work/config.json
+cp scripts/manifest_worker/examples/inventory.json work/inventory.json
 ```
 
-## Local dry run: Agendas, 1976
+Run all commands below from the repository directory.
 
-This sample resolves ArchivesSpace archival object 139132 / Compass PID
-`smith:1348191` to **Drupal node 80405**. The PID suffix is not the node ID.
-The sample was selected for local testing; this does not grant production publication
-approval. The following creates private local test configuration under ignored `work/`.
-It contains no publication directory and does not upload anything.
+## Configure
 
-```sh
-python3 - <<'PYCONFIG'
-import json
-from pathlib import Path
-root = Path('work/agendas').resolve()
-root.mkdir(parents=True, exist_ok=True)
-item = 'smith_ssc_ms00697_as139132_001'
-inventory = {item: {
-    'node_id': '80405',
-    'access': 'public',
-    'policy': 'selected-sample-local-dry-run-only',
-    'approved_by': 'local-test-operator',
-    'original_uri': 'https://compass.fivecolleges.edu/object/smith:1348191',
-    'aspace_record': '/repositories/2/archival_objects/139132'
-}}
-config = {
-    'manifest_base': 'https://libtools2.smith.edu/digital/manifests',
-    'image_base': 'https://digital.smith.edu/iiif/2',
-    'source_root': str(root / 'sources'),
-    'state_dir': str(root / 'state'),
-    'inventory': str(root / 'inventory.json'),
-    'allowed_hosts': ['compass.fivecolleges.edu', 'digital.smith.edu'],
-    'allow_live': True
+Edit `work/config.json`. Use absolute filesystem paths and your destination URLs:
+
+```json
+{
+  "manifest_base": "https://collections.example.org/manifests",
+  "image_base": "https://images.example.org/iiif/2",
+  "publish_dir": "/absolute/path/to/web/manifests",
+  "source_root": "/absolute/path/to/manifest-conversion/work/sources",
+  "state_dir": "/absolute/path/to/manifest-conversion/work/state",
+  "inventory": "/absolute/path/to/manifest-conversion/work/inventory.json",
+  "allowed_hosts": [
+    "compass.fivecolleges.edu",
+    "images.example.org",
+    "collections.example.org"
+  ],
+  "pui_origin": "https://archives.example.org",
+  "allow_live": false,
+  "withdrawn_items": []
 }
-(root / 'inventory.json').write_text(json.dumps(inventory, indent=2))
-(root / 'config.json').write_text(json.dumps(config, indent=2))
-(root / 'jobs.csv').write_text('item_id\n' + item + '\n')
-PYCONFIG
-
-python3 -m scripts.manifest_worker \
-  --config work/agendas/config.json \
-  --jobs work/agendas/jobs.csv
 ```
 
-On the tested Mac, Python needed the system CA bundle. If the default trust store
-fails, use the maintained CA bundle for your host. For this Mac:
+| Setting | Purpose |
+| --- | --- |
+| `manifest_base` | Public URL prefix for converted manifests. |
+| `image_base` | Destination IIIF Image API 2 base URL. |
+| `publish_dir` | Existing local web directory to write when using `--publish`. |
+| `source_root` | Directory containing retained source manifests. |
+| `state_dir` | Private directory for artifacts, receipts, history, and reports. Keep outside the web root. |
+| `inventory` | Operator-maintained JSON file mapping item IDs to source and approval information. |
+| `allowed_hosts` | Hostnames the worker may request over HTTPS, including redirect destinations. |
+| `pui_origin` | Viewer origin allowed by the manifest server's CORS header; wildcard CORS is also accepted. |
+| `allow_live` | Allow fetching source manifests from Compass instead of retained files. |
+| `withdrawn_items` | Item IDs that must not be processed or republished. |
+
+## Add items
+
+Edit `work/inventory.json`. Each item needs a unique ID and its actual Drupal node
+ID. A legacy object identifier is not necessarily the Drupal node ID.
+
+```json
+{
+  "item-001": {
+    "node_id": "123",
+    "source_file": "123-manifest.json",
+    "source_sha256": "REPLACE_WITH_SOURCE_FILE_SHA256",
+    "access": "public",
+    "policy": "REPLACE_WITH_APPLICABLE_ACCESS_POLICY",
+    "approved_by": "REPLACE_WITH_APPROVING_AUTHORITY"
+  }
+}
+```
+
+Place the original manifest under `source_root` and record its SHA-256 checksum.
+Set `access` to `public` only after confirming publication eligibility. Unknown or
+restricted items are rejected. Optional `original_uri` and `aspace_record` fields
+are included in reports.
+
+For live harvesting, omit `source_file` and enable `allow_live`. The worker fetches
+`https://compass.fivecolleges.edu/node/{node_id}/manifest` and retains its bytes and
+checksum. Live harvesting is disabled on and after 1 July 2027; retained-file
+processing continues to work.
+
+Create `work/incoming/batch.csv` with exactly one column:
+
+```csv
+item_id
+item-001
+```
+
+CSV rows reference approved inventory entries; they cannot supply access approval.
+
+## Run a dry run
 
 ```sh
-SSL_CERT_FILE=/etc/ssl/cert.pem python3 -m scripts.manifest_worker \
-  --config work/agendas/config.json \
-  --jobs work/agendas/jobs.csv
+python3 -m scripts.manifest_worker \
+  --config work/config.json \
+  --jobs work/incoming/batch.csv
 ```
 
-Do not disable TLS verification. A successful summary reports `failed: 0` and
-`published_mode: false`. Converted output is:
+This validates sources and image services, then saves converted manifests under
+`state_dir/artifacts/`. It does not write to the publication directory. The summary
+reports the number of failures and the path to a CSV report.
 
-```text
-work/agendas/state/artifacts/smith_ssc_ms00697_as139132_001.json
+## Publish
+
+Create the publication directory and configure its web server to serve JSON with:
+
+- `Cache-Control: no-cache` or `no-store`.
+- `Access-Control-Allow-Origin` matching `pui_origin`, or `*`.
+
+Then run:
+
+```sh
+python3 -m scripts.manifest_worker \
+  --config work/config.json \
+  --jobs work/incoming/batch.csv \
+  --publish
 ```
 
-Reports, original manifest bytes/checksums and page mappings stay under `work/agendas/state/`.
-The manifest's libtools2 ID is its proposed destination; a dry run does not make that URL live.
-Live Compass harvesting expires on 1 July 2027; retain manifests and Drupal mappings before then.
+Publication writes atomically to `publish_dir` and verifies the resulting HTTPS
+response. Run on the publication host: this command does not transfer files over
+SSH or SFTP. It refuses to overwrite existing files it does not own.
 
-## Publication and unattended operation
+A failed verification can occur after a file has been written. Inspect the receipt
+and report, then rerun the job to retry. No ArchivesSpace records are updated.
 
-Read the [operator runbook](scripts/manifest_worker/README.md) for approved inventories,
-server directories, cache/CORS configuration, dry runs, `--publish`, cron and recovery.
-Production access approval is separate from the sample above.
+## Process a folder
 
-The current publisher writes to a local directory: run it **on libtools2** under an
-appropriately restricted account. Running `--publish` on a Mac does not upload over
-SFTP. Destination files are written atomically and verified over HTTPS. There is no
-remote SFTP client in this version.
+```sh
+python3 -m scripts.manifest_worker \
+  --config work/config.json \
+  --inbox work/incoming \
+  --publish
+```
 
-Staff CSVs contain one column, `item_id`, referring to an operator-maintained inventory.
-An inbox can be polled by cron. Staff should not need to install Python once the worker
-is deployed. Unsupported manifest/media structures are reported for review.
+Schedule this command with cron if needed. Upload jobs with a temporary extension,
+then rename them to `.csv` when complete. Jobs remain in the folder and are rechecked
+on each run; archive completed CSVs to avoid repeated checks. Keep one shared state
+directory for all runs targeting the same publication directory.
 
-## Proposed simpler staff interface
-
-A shared Google Sheet can replace CSV submission and display status, results and
-manifest URLs. Staff add rows; the server runs the worker. This adapter is **not yet
-implemented**. See the [Google Sheets workflow](docs/google-sheets-queue.md).
-
-## Development
-
-Source and tests: `scripts/manifest_worker/`. The initial code was exported from the
-preservica project at commit `32e15ee`; local Agendas test evidence was recorded at
-`809784c`. No credentials, raw manifests, local configuration or source images are
-included in this repository. Source snapshots must be reconciled deliberately when
-moving fixes between the two repositories.
+See the [operator runbook](scripts/manifest_worker/README.md) for limits, recovery,
+permissions, and TLS troubleshooting.
