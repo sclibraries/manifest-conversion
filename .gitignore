@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+work/
+state/
+sources/
+incoming/
+published/
+config.local.json
+inventory.local.json
+*credentials*.json
+*.pem
+*.key
+.DS_Store

@@ -1,0 +1,12 @@
+{
+  "manifest_base": "https://libtools2.smith.edu/digital/manifests",
+  "image_base": "https://digital.smith.edu/iiif/2",
+  "publish_dir": "/home/www/html/digital/manifests",
+  "source_root": "/var/lib/manifest-worker/sources",
+  "state_dir": "/var/lib/manifest-worker/state",
+  "inventory": "/etc/manifest-worker/inventory.json",
+  "allowed_hosts": ["compass.fivecolleges.edu", "digital.smith.edu", "libtools2.smith.edu"],
+  "pui_origin": "https://findingaids-test.smith.edu",
+  "allow_live": false,
+  "withdrawn_items": []
+}

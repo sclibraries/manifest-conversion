@@ -1,0 +1,12 @@
+{
+  "example-item": {
+    "node_id": "123",
+    "source_file": "123-manifest.json",
+    "source_sha256": "REPLACE_WITH_VERIFIED_SHA256",
+    "access": "unreviewed",
+    "policy": "",
+    "approved_by": "",
+    "original_uri": "https://compass.fivecolleges.edu/node/123",
+    "aspace_record": ""
+  }
+}
