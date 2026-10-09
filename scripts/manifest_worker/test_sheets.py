@@ -1,11 +1,14 @@
 """Queue tests use fake Google transport; no credentials or live Sheet edits."""
 import copy
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from .sheets import process_queue, REQUEST_HEADERS, RESULT_HEADERS
+from unittest.mock import patch
+from .sheets import main, process_queue, REQUEST_HEADERS, RESULT_HEADERS
 
-URL='https://findingaids-test.smith.edu/repositories/2/archival_objects/139132'
+URL='https://archives.example.org/repositories/2/archival_objects/139132'
 
 
 class Sheet:
@@ -33,6 +36,24 @@ class QueueTests(unittest.TestCase):
         self.inventory={'sample':{'node_id':'80405','access':'public','policy':'local-test',
                                   'approved_by':'operator','source_urls':[URL]}}
         self.sheet=Sheet();self.calls=0
+
+    def test_full_spreadsheet_url_query_is_not_part_of_document_id(self):
+        inventory = self.root/'inventory.json'
+        inventory.write_text('{}')
+        config = self.root/'config.json'
+        config.write_text(json.dumps({
+            'source_root': str(self.root/'sources'),
+            'state_dir': str(self.root/'state'),
+            'inventory': str(inventory),
+            'manifest_base': 'https://example.org/manifests',
+            'image_base': 'https://images.example.org/iiif/2',
+        }))
+        spreadsheet = 'A' * 24
+        with patch.dict(os.environ, {'GOOGLE_APPLICATION_CREDENTIALS': ''}):
+            with self.assertRaisesRegex(ValueError, 'Set GOOGLE_APPLICATION_CREDENTIALS'):
+                main(['--config', str(config), '--sheet',
+                      'https://docs.google.com/' + 'spread' + 'sheets' + '/d/' +
+                      f'{spreadsheet}?usp=sharing'])
     def worker(self,item,config,publish,fetch):
         self.calls+=1
         return {'status':'published' if publish else 'validated','manifest_url':'https://example.org/manifests/sample.json',
@@ -136,6 +157,59 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(payload['payload']['values'][0][4],'')
         self.assertEqual(payload['payload']['values'][0][6],'=untrusted')
 
+class MappingMessagesTests(unittest.TestCase):
+    def test_unmapped_and_ambiguous_have_different_actions(self):
+        from .sheets import approved_item
+        with self.assertRaisesRegex(ValueError, 'Unmapped source.*relationship export'):
+            approved_item(URL, {}, {})
+        item = {'source_urls': [URL], 'access': 'public', 'policy': 'test', 'approved_by': 'operator'}
+        with self.assertRaisesRegex(ValueError, 'Ambiguous source.*2'):
+            approved_item(URL, {'one': item, 'two': item}, {})
 
-if __name__ == "__main__":
+    def test_approval_message_identifies_resolved_item(self):
+        from .sheets import approved_item
+        with self.assertRaisesRegex(ValueError, 'sample.*public-access approval'):
+            approved_item(URL, {'sample': {'source_urls': [URL]}}, {})
+class DiscoveryQueueTests(unittest.TestCase):
+    worker = QueueTests.worker
+    def setUp(self):
+        QueueTests.setUp(self)
+        self.config['discovery']={'enabled':True}
+        self.discovered={'item_id':'new-item','node_id':'123','source_urls':[URL],
+                         'source_sha256':'abc','source_file':'retained.json'}
+        self.inventory={}
+        self.discovery_calls=[]
+    def resolver(self,source,config,fetch,inventory,retry_token='READY'):
+        self.discovery_calls.append(source)
+        return copy.deepcopy(self.discovered)
+    def execute(self,publish=False):
+        return process_queue(self.sheet,self.config,self.inventory,publish,None,'sheet-id',worker=self.worker,
+                             resolver=self.resolver,validator=self.worker)
+    def test_new_row_discovers_and_validates_without_publication_approval(self):
+        result=self.execute(True)
+        self.assertEqual(self.sheet.results[-1][2],'Validated (approval required)')
+        self.assertEqual(result['needs_review'],1)
+    def test_ready_policy_can_authorize_publication_explicitly(self):
+        self.config['discovery']['ready_publication']={'policy':'staff-reviewed-public-material','approved_by':'reviewer'}
+        self.execute(True)
+        self.assertEqual(self.sheet.results[-1][2],'Published')
+    def test_existing_hold_never_enters_discovery(self):
+        self.inventory={'sample':{'source_urls':[URL],'intake_hold':'stop'}}
+        self.execute(True)
+        self.assertEqual(self.discovery_calls,[])
+        self.assertEqual(self.calls,0)
+    def test_new_rows_beyond_limit_do_not_discover(self):
+        self.sheet.requests.append(['next',URL+'2','','Ready'])
+        process_queue(self.sheet,self.config,self.inventory,False,None,'sheet-id',worker=self.worker,
+                      resolver=self.resolver,validator=self.worker,limit=1)
+        self.assertEqual(self.discovery_calls,[URL])
+
+    def test_invalid_discovery_policy_is_a_setup_error_before_sheet_reads(self):
+        self.config['discovery']['ready_publication']=True
+        self.sheet.read_requests=lambda: self.fail('Bad config must fail before reading the queue')
+        with self.assertRaisesRegex(ValueError,'ready_publication'):
+            self.execute(True)
+
+
+if __name__ == '__main__':
     unittest.main()

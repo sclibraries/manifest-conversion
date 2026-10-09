@@ -8,8 +8,8 @@ from .core import convert, load_json, safe_id, safe_cell, contained, encode, dig
 from .runner import run_item
 
 SOURCE = 'https://compass.fivecolleges.edu/node/123/manifest'
-BASE = 'https://libtools2.smith.edu/digital/manifests'
-IMAGE = 'https://digital.smith.edu/iiif/2'
+BASE = 'https://collections.example.org/manifests'
+IMAGE = 'https://images.example.org/iiif/2'
 SERVICE = 'https://compass.fivecolleges.edu/cantaloupe/iiif/2/https%3A%2F%2Fcompass.fivecolleges.edu%2Fsystem%2Ffiles%2F2024-09%2Fpage%2520one.tif'
 
 
@@ -85,7 +85,7 @@ class RunnerTests(unittest.TestCase):
         self.data = encode(manifest()); (self.root/'sources/source.json').write_bytes(self.data)
         self.config = {'manifest_base': BASE, 'image_base': IMAGE,
                        'source_root': str(self.root/'sources'), 'state_dir': str(self.root/'state'),
-                       'publish_dir': str(self.root/'published'), 'allowed_hosts': ['digital.smith.edu','libtools2.smith.edu','compass.fivecolleges.edu']}
+                       'publish_dir': str(self.root/'published'), 'allowed_hosts': ['images.example.org','collections.example.org','compass.fivecolleges.edu']}
         self.item = {'item_id':'sample','node_id':'123','source_file':'source.json','source_sha256':digest(self.data),
                      'access':'public','policy':'review-1','approved_by':'collection-review'}
         self.calls=[]
@@ -100,6 +100,15 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result['status'],'validated')
         self.assertFalse((self.root/'published/sample.json').exists())
         self.assertTrue((self.root/'state/artifacts/sample.json').exists())
+
+    def test_discovery_validation_cannot_grant_publication_approval(self):
+        item={key:value for key,value in self.item.items() if key not in ('access','policy','approved_by')}
+        result=run_item(item,self.config,False,self.fetch,validation_only=True)
+        self.assertFalse(result['publication_authorized'])
+        self.assertEqual(result['approved_by'],'')
+        self.assertEqual(list((self.root/'published').iterdir()),[])
+        with self.assertRaises(ValueError):
+            run_item(item,self.config,True,self.fetch,validation_only=True)
 
     def test_publish_verify_repeat_and_collision(self):
         result=run_item(self.item,self.config,True,self.fetch)

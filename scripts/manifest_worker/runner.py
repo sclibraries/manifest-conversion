@@ -25,10 +25,21 @@ def bounded_file(path):
     return data
 
 
-def run_item(item, config, publish, fetch):
+def publication_allowed(item):
+    return item.get('access') == 'public' and bool(item.get('policy')) and bool(item.get('approved_by'))
+
+
+def validate_discovered_item(item, config, publish, fetch):
+    if publish: raise ValueError('Discovery validation cannot publish')
+    return run_item(item, config, False, fetch, validation_only=True)
+
+
+def run_item(item, config, publish, fetch, *, validation_only=False):
     name=safe_id(item['item_id'])
+    if validation_only and publish: raise ValueError('Discovery validation cannot publish')
+    if item.get('intake_hold'): raise ValueError('Intake hold: ' + item['intake_hold'])
     if name in config.get('withdrawn_items',[]): raise ValueError('withdrawn item')
-    if item.get('access')!='public' or not item.get('policy') or not item.get('approved_by'):
+    if not validation_only and not publication_allowed(item):
         raise ValueError('explicit public access policy and approving authority required')
     node=item.get('node_id','')
     if not str(node).isdigit(): raise ValueError('exported numeric node mapping required')
@@ -62,7 +73,8 @@ def run_item(item, config, publish, fetch):
     previous=load_json(bounded_file(receipt_path)) if receipt_path.exists() else {}
     receipt={'item_id':name,'node_id':str(node),'source_uri':source_url,
              'source_sha256':digest(raw),'sha256':checksum,'manifest_url':canonical,
-             'converter_version':VERSION,'access_policy':item['policy'],'approved_by':item['approved_by'],
+             'converter_version':VERSION,'access_policy':item.get('policy',''),'approved_by':item.get('approved_by',''),
+             'publication_authorized':publication_allowed(item),
              'aspace_record':item.get('aspace_record',''),'original_uri':item.get('original_uri',source_url),
              'timestamp':datetime.now(timezone.utc).isoformat(), **details}
     atomic_write(contained(state,'sources/'+name+'-'+digest(raw)+'.json'),raw)

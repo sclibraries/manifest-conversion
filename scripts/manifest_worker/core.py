@@ -63,6 +63,8 @@ def load_json(data, limit=8*1024*1024):
 
 
 def https_url(url):
+    if not isinstance(url, str):
+        raise ValueError('expected HTTPS URL text')
     parsed = urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None,443) or parsed.fragment:
         raise ValueError('expected HTTPS URL without credentials or fragment')

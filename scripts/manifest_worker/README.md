@@ -1,6 +1,6 @@
-# Manifest harvester and libtools2 publisher
+# Manifest harvester and publisher
 
-MC-001 implementation: standard-library Python 3.11+ command for Linux/macOS.
+Standard-library Python 3.11+ command for Linux/macOS.
 Run from the repository root. No Python packages, SSH keys or AWS credentials are
 required when the worker runs on the publication host. Local dry runs work on a Mac.
 
@@ -8,13 +8,13 @@ required when the worker runs on the publication host. Local dry runs work on a 
 
 - Reads operator-reviewed node mappings and retained manifest checksums.
 - Optionally harvests `/node/N/manifest` over HTTPS before 1 July 2027.
-- Converts supported Compass IIIF Presentation 2 image manifests to
-  digital.smith.edu services, preserving canvas IDs, order, dimensions and metadata.
+- Converts supported Compass IIIF Presentation 2 image manifests to the configured
+  IIIF Image API service, preserving canvas IDs, order, dimensions and metadata.
 - Verifies each image's info.json dimensions and service identifier.
 - Stages converted JSON and receipts; publishes only with `--publish`.
-- Writes directly to a configured local web directory on libtools2 with atomic rename.
-  A remote SFTP client is not included: run this worker on libtools2, or use a
-  separately managed transfer of staged artifacts if operations requires another host.
+- Writes directly to the configured local publication directory with atomic rename.
+  A remote SFTP client is not included: run the worker on the host that serves the
+  configured publication directory, or arrange a separately managed transfer.
 - Verifies canonical HTTPS bytes, CORS and revalidation cache headers after writing.
 - Keeps old artifacts privately, prevents overwriting unowned/externally changed files,
   resumes interrupted publication and records unchanged repeats.
@@ -25,9 +25,9 @@ remote server configuration happen automatically. New scans still use workbench-
 
 ## Operator setup (once)
 
-Start with `examples/config.json`; the libtools2 path and URL follow the existing
-pilot documentation, but must be confirmed on the execution host. Configure absolute
-paths and create the publication directory separately. Keep state, retained sources,
+Start with `examples/config.json`; its paths and URLs are placeholders. Replace them
+with deployment-approved values and create the publication directory separately. Keep
+state, retained sources,
 approval inventory and configuration outside the public web root. The worker user
 needs write access only to its private state and the manifest directory. Restrict
 config/inventory edits to operators; staff submit jobs, not approval metadata.
@@ -43,16 +43,16 @@ No-cache permits storage but requires revalidation. Validate browser behavior an
 withdrawal/cache invalidation on the hosted origin before production acceptance.
 
 Prepare the operator inventory, keyed by a stable output ID. It contains numeric
-Drupal node IDs, not Islandora PIDs. Resolve PIDs from the reviewed Drupal export;
-never assume the number in `smith:1348191` is a node ID. Source fields:
+source node IDs. Resolve them from the approved relationship mapping; do not infer
+a node ID from a legacy identifier. Source fields:
 
 - `source_file`: relative retained-manifest path under source_root, with `source_sha256`.
 - Or omit source_file and explicitly set `allow_live: true` in trusted configuration.
   Live responses and their checksums are saved locally. The source must identify
   exactly the approved node. Live harvesting is disabled on/after 1 July 2027.
 - `access: public`, nonempty `policy` and `approved_by` are mandatory. This is a
-  recorded operator decision, not an automatic inference from Drupal terms or URLs.
-  Establish the collection access policy/export outside this command before approving.
+  recorded operator decision, not an automatic inference from source metadata.
+  Establish the applicable access policy outside this command before approving.
 - Optional `original_uri` and `aspace_record` are copied into reports for review.
 
 The example inventory is intentionally unapproved and cannot publish.
@@ -64,22 +64,22 @@ Node/source changes belong in the reviewed inventory, not untrusted jobs.
 Validate, fetch image metadata and stage files without writing the web directory:
 
 ```sh
-python3 -m scripts.manifest_worker --config /etc/manifest-worker/config.json \
-  --jobs /var/lib/manifest-worker/incoming/batch.csv
+python3 -m scripts.manifest_worker --config /path/to/private/worker-config.json \
+  --jobs /path/to/private/incoming/batch.csv
 ```
 
 After inspecting artifacts and receipts, run the same command with `--publish`.
 For a staff drop folder:
 
 ```sh
-python3 -m scripts.manifest_worker --config /etc/manifest-worker/config.json \
-  --inbox /var/lib/manifest-worker/incoming --publish
+python3 -m scripts.manifest_worker --config /path/to/private/worker-config.json \
+  --inbox /path/to/private/incoming --publish
 ```
 
 An example cron entry, after installation and access review:
 
 ```cron
-*/15 * * * * cd /opt/preservica && /usr/bin/python3 -m scripts.manifest_worker --config /etc/manifest-worker/config.json --inbox /var/lib/manifest-worker/incoming --publish >> /var/log/manifest-worker.log 2>&1
+*/15 * * * * cd /path/to/manifest-conversion && /usr/bin/python3 -m scripts.manifest_worker --config /path/to/private/worker-config.json --inbox /path/to/private/incoming --publish >> /path/to/private/worker.log 2>&1
 ```
 
 Upload as `.part` and rename to `.csv` only when complete. Use authenticated accounts;
@@ -93,10 +93,10 @@ Repeated items keep stable URLs, but still validate current input/images/public 
 A full-migration operator can split its approved inventory into bounded CSV batches;
 the staff folder is not the bulk migration inventory or a replacement for Drupal exports.
 
-On this Mac, Python required the system CA bundle for HTTPS verification:
+If Python cannot locate the system CA bundle, set `SSL_CERT_FILE` to its path:
 
 ```sh
-SSL_CERT_FILE=/etc/ssl/cert.pem python3 -m scripts.manifest_worker --config CONFIG --jobs JOBS
+SSL_CERT_FILE=/path/to/system-ca-bundle.pem python3 -m scripts.manifest_worker --config CONFIG --jobs JOBS
 ```
 
 Use the execution host's maintained CA bundle; never disable certificate verification.
@@ -143,9 +143,9 @@ remain deployment acceptance tasks. Metadata is untrusted; consumers must still 
 ## Tests
 
 ```sh
-python3 -m unittest scripts.manifest_worker.test_worker
+python3 -m unittest discover -s scripts/manifest_worker -t .
 ```
 
 Tests use local files and injected HTTP responses, including atomic-write interruption,
 public verification failure, repeat runs, source integrity, path containment and
-unauthorized jobs. Live dry-run evidence is recorded separately in the completion ledger.
+unauthorized jobs.

@@ -7,24 +7,32 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 from .core import contained, digest, encode, https_url, load_json, safe_id
-from .runner import atomic_write, bounded_file, run_item
+from .runner import atomic_write, bounded_file, run_item, publication_allowed, validate_discovered_item
 from .transport import Fetcher
+from .urls import normalized_source, ASPACE_HOSTS
 
 REQUEST_HEADERS = ['Request ID', 'Source URL', 'Notes', 'Ready']
 RESULT_HEADERS = ['Request ID', 'Source URL', 'Status', 'Manifest URL', 'Last Run', 'Result', 'Operation ID']
 
 
-def normalized_source(value):
-    parsed = https_url(value.strip())
-    if parsed.query:
-        raise ValueError('Source URL must not have query parameters')
-    path = unquote(parsed.path).rstrip('/')
-    if parsed.hostname == 'compass.fivecolleges.edu' and path.startswith('/object/'):
-        path = '/islandora' + path
-    return parsed.hostname.lower() + path
+class UnmappedSource(ValueError):
+    pass
+
+
+def _spreadsheet_id(value):
+    prefix = 'https://docs.google.com/'
+    if value.startswith(prefix):
+        parsed = urlsplit(value)
+        path = parsed.path.split('/')
+        if parsed.netloc != 'docs.google.com' or path[1:3] != ['spreadsheets', 'd'] or len(path) < 4:
+            raise ValueError('Invalid spreadsheet ID')
+        value = path[3]
+    if not re.fullmatch(r'[A-Za-z0-9_-]{20,100}', value):
+        raise ValueError('Invalid spreadsheet ID')
+    return value
 
 
 def parse_requests(values):
@@ -58,6 +66,8 @@ def approved_item(source, inventory, config):
     key = normalized_source(source)
     matches = []
     for name, record in inventory.items():
+        if key in record.get('blocked_source_keys', []):
+            raise ValueError('Ambiguous or incomplete source: reconcile the relationship export or submit an individual digital-object URL.')
         aliases = list(record.get('source_urls', []))
         if record.get('original_uri'):
             aliases.append(record['original_uri'])
@@ -67,13 +77,17 @@ def approved_item(source, inventory, config):
                         'https://compass.fivecolleges.edu/node/'+node+'/manifest']
         if any(normalized_source(alias) == key for alias in aliases):
             matches.append(dict(record, item_id=safe_id(name)))
-    if len(matches) != 1:
-        raise ValueError('Source must match exactly one operator-approved inventory entry')
+    if not matches:
+        raise UnmappedSource('Unmapped source: include this URL and its linked digital objects in the relationship export, then run intake.')
+    if len(matches) > 1:
+        raise ValueError('Ambiguous source: matches ' + str(len(matches)) + ' inventory entries; reconcile the mapping or submit individual digital-object URLs.')
     item = matches[0]
+    if item.get('intake_hold'):
+        raise ValueError('Intake hold: ' + item['intake_hold'])
     if item['item_id'] in config.get('withdrawn_items', []):
         raise ValueError('Item is withdrawn; do not republish')
     if item.get('access') != 'public' or not item.get('policy') or not item.get('approved_by'):
-        raise ValueError('Public access approval is missing')
+        raise ValueError(item['item_id'] + ': mapping found; operator public-access approval is missing.')
     return item
 
 
@@ -91,7 +105,18 @@ def result_keys(values):
     return keys
 
 
-def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run_item, limit=10):
+def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run_item, limit=10,
+                  resolver=None, validator=validate_discovered_item):
+    options = config.get('discovery', {})
+    if not isinstance(options, dict) or not isinstance(options.get('enabled', False), bool):
+        raise ValueError('discovery must be an object with a Boolean enabled setting')
+    approval = options.get('ready_publication', {})
+    if not isinstance(approval, dict) or (approval and any(not isinstance(approval.get(field), str) or not approval[field].strip()
+                                                        for field in ('policy', 'approved_by'))):
+        raise ValueError('ready_publication must be an object with a policy and approving authority, or omitted')
+    if resolver is None:
+        from .discovery import discover
+        resolver = discover
     rows = parse_requests(sheet.read_requests())
     keys = result_keys(sheet.read_results())
     state = Path(config['state_dir']).resolve()
@@ -101,9 +126,22 @@ def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run
     for request in rows:
         if not request['enabled']:
             continue
+        if summary['processed'] + summary['reconciled'] >= limit:
+            break
         review_error = ''
+        approval_required = False
         try:
-            item = approved_item(request['source_url'], inventory, config)
+            try:
+                item = approved_item(request['source_url'], inventory, config)
+            except UnmappedSource:
+                options = config.get('discovery', {})
+                if not options.get('enabled'):
+                    raise
+                item = resolver(request['source_url'], config, fetch, inventory, retry_token=request['ready'])
+                approval = options.get('ready_publication', {})
+                if not publication_allowed(item) and approval.get('policy') and approval.get('approved_by'):
+                    item = dict(item, access='public', policy=approval['policy'], approved_by=approval['approved_by'])
+                approval_required = not publication_allowed(item)
         except ValueError as error:
             item = None
             review_error = str(error)
@@ -135,11 +173,15 @@ def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run
             summary['needs_review'] += 1
         else:
             try:
-                receipt = worker(item, config, publish, fetch)
+                operation = validator if approval_required else worker
+                receipt = operation(item, config, publish and not approval_required, fetch)
                 url = receipt['manifest_url']
-                status = 'Published' if publish else 'Validated (dry run)'
+                status = 'Validated (approval required)' if approval_required else ('Published' if publish else 'Validated (dry run)')
                 message = str(len(receipt['pages'])) + ' pages validated. '
-                message += 'HTTPS publication verified.' if publish else 'Manifest staged locally; URL is proposed, not published.'
+                message += 'HTTPS publication verified.' if publish and not approval_required else 'Manifest staged locally; URL is proposed, not published.'
+                if approval_required:
+                    message += ' Public-publication approval is required.'
+                    summary['needs_review'] += 1
             except (ValueError, OSError, KeyError, TypeError) as error:
                 status = 'Failed'
                 message = str(error)[:500]
@@ -173,11 +215,7 @@ def main(argv=None):
         raise ValueError('--limit must be between 1 and 100')
     if args.requests_tab == args.results_tab:
         raise ValueError('Requests and Results must be separate tabs')
-    sheet_id = args.sheet
-    if sheet_id.startswith('https://docs.google.com/spreadsheets/d/'):
-        sheet_id = sheet_id.split('/d/',1)[1].split('/',1)[0]
-    if not re.fullmatch(r'[A-Za-z0-9_-]{20,100}', sheet_id):
-        raise ValueError('Invalid spreadsheet ID')
+    sheet_id = _spreadsheet_id(args.sheet)
     credential_path = args.credentials or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
     if not credential_path:
         raise ValueError('Set GOOGLE_APPLICATION_CREDENTIALS or pass --credentials')
@@ -207,7 +245,10 @@ def main(argv=None):
         sheet = GoogleSheet(sheet_id, credential_path, args.requests_tab, args.results_tab)
         if args.initialize_results:
             sheet.initialize_results()
-        fetch = Fetcher(config['allowed_hosts'])
+        hosts = set(config['allowed_hosts'])
+        if config.get('discovery', {}).get('enabled'):
+            hosts.update(config['discovery'].get('aspace_public_hosts', ASPACE_HOSTS))
+        fetch = Fetcher(hosts)
         result = process_queue(sheet,config,inventory,args.publish,fetch,sheet_id,limit=args.limit)
     result.update(published_mode=args.publish, requests=fetch.requests, bytes=fetch.bytes)
     print(json.dumps(result))

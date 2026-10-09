@@ -28,8 +28,10 @@ class Fetcher:
         for attempt in range(3):
             self.check(url)
             try:
-                request=urllib.request.Request(url,headers={'Accept':'application/json','Cache-Control':'no-cache','User-Agent':'SmithManifestWorker/1'})
+                request=urllib.request.Request(url,headers={'Accept':'application/json','Cache-Control':'no-cache','User-Agent':'ManifestWorker/1'})
                 with self.opener.open(request,timeout=20) as response:
+                    if response.status != 200:
+                        raise ValueError('HTTP ' + str(response.status) + ': source did not return usable content; check public-page access or bot protection')
                     parts=[]; size=0
                     while True:
                         chunk=response.read(65536)

@@ -63,8 +63,15 @@ Edit `work/config.json`. Use absolute filesystem paths and your destination URLs
 
 ## Add items
 
-Edit `work/inventory.json`. Each item needs a unique ID and its actual Drupal node
-ID. A legacy object identifier is not necessarily the Drupal node ID.
+[Automatic URL discovery](docs/url-discovery.md) can resolve newly submitted
+public record or Compass URLs. It is opt-in and needs working public-page access
+from the scheduled host to every configured public-record host.
+
+For several items, use [bulk intake and preflight](docs/intake.md) to build a candidate
+inventory from retained relationship evidence before staff submit URLs.
+
+Edit `work/inventory.json`. Each item needs a unique ID and its actual source node
+ID. A legacy object identifier is not necessarily the source node ID.
 
 ```json
 {
@@ -170,3 +177,15 @@ python3 -m scripts.manifest_worker.sheets \
 This defaults to a local dry run, but writes its outcome to the Results tab.
 Completed requests are skipped on subsequent runs. Add `--publish` only when
 running on the configured manifest publication host.
+
+## Tests
+
+Run the worker's unit suite from the repository root:
+
+```sh
+python3 -m unittest discover -s scripts/manifest_worker -t .
+```
+
+## License
+
+This project is dedicated to the public domain under CC0 1.0 Universal; see [LICENSE](LICENSE).
