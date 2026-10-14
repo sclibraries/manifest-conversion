@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +62,52 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue((self.root / 'sources' / item['source_file']).is_file())
         self.assertIn(AO, item['source_urls'])
         self.assertNotIn('approved_by', item)
+
+    def test_fresh_discovery_item_and_retained_outputs_are_pinned(self):
+        item = self.run_discovery()
+        expected = {
+            'aspace_record': AO,
+            'item_id': 'demo_item',
+            'node_id': '123',
+            'original_uri': COMPASS,
+            'source_file': (
+                'discovery/f67bd611e4519bafeeb69a891986d566384aa4dc28c4146945bdcb6064c42824.json'
+            ),
+            'source_sha256': ('f67bd611e4519bafeeb69a891986d566384aa4dc28c4146945bdcb6064c42824'),
+            'source_urls': [AO, DO, COMPASS, NODE, NODE + '/manifest'],
+        }
+        self.assertEqual(item, expected)
+
+        cache = json.loads((self.root / 'state' / 'discovery' / 'cache.json').read_bytes())
+        self.assertEqual(
+            cache,
+            {
+                'errors': {},
+                'items': {
+                    alias.removeprefix('https://'): expected for alias in expected['source_urls']
+                },
+            },
+        )
+        source_path = self.root / 'sources' / expected['source_file']
+        self.assertEqual(source_path.read_bytes(), self.documents[NODE + '/manifest'])
+
+        evidence_files = list((self.root / 'state' / 'discovery' / 'evidence').glob('*.json'))
+        self.assertEqual(len(evidence_files), 1)
+        evidence = json.loads(evidence_files[0].read_bytes())
+        self.assertEqual(evidence['item'], expected)
+        self.assertEqual(
+            [read['url'] for read in evidence['reads']],
+            [AO, DO, COMPASS + '?_format=json', NODE + '/manifest'],
+        )
+        self.assertEqual(
+            [read['sha256'] for read in evidence['reads']],
+            [
+                '6f5782133e2f252ba9d4928eb099bcbc9354d0b87fa289997cb8feda9bebde83',
+                '9d5870cf1e76e7eade0bd1128f8b11abf31225463ac0140765992fd0fd1ebbbd',
+                'cf36ecab4c5084e5dbbef33c6f7a5cff531f3864e5481cc2e92b0d4ba789d695',
+                expected['source_sha256'],
+            ],
+        )
 
     def test_cached_mapping_and_compass_alias_need_no_network(self):
         original = self.run_discovery()
