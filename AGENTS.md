@@ -18,8 +18,23 @@ Run the unit suite from the repository root:
 python3 -m unittest discover -s scripts/manifest_worker -t .
 ```
 
+Install the development tools and run Ruff lint and format checks from the repository root:
+
+```sh
+python3 -m pip install -r requirements-dev.txt
+python3 -m ruff check .
+python3 -m ruff format --check .
+```
+
 Tests use synthetic fixtures and local HTTP doubles. They must not need credentials, network
 access, production services, or staff inputs.
+
+## Code standards
+
+- Follow DRY and SOLID; keep modules and functions focused and readable.
+- Keep functions lean (about 40 lines, complexity at most 10, and no more than 40 statements).
+  Track existing metric baselines with per-function suppressions for only the exceeded rules.
+- Keep Ruff lint and formatting checks clean.
 
 ## Interfaces other systems depend on
 

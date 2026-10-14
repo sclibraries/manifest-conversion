@@ -1,4 +1,5 @@
 """Source URL identity shared by intake, discovery and the Sheet queue."""
+
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from .core import https_url
 

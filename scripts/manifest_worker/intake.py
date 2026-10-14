@@ -1,4 +1,5 @@
 """Prepare an inventory from retained relationship evidence, without remote writes."""
+
 import argparse
 import copy
 import csv
@@ -17,10 +18,11 @@ def aliases(source):
         raise ValueError('Source node_id must be numeric')
     return list(source.get('source_urls', [])) + [
         'https://compass.fivecolleges.edu/node/' + node,
-        'https://compass.fivecolleges.edu/node/' + node + '/manifest']
+        'https://compass.fivecolleges.edu/node/' + node + '/manifest',
+    ]
 
 
-def prepare(snapshot, source_root, config, urls, approvals, existing):
+def prepare(snapshot, source_root, config, urls, approvals, existing):  # noqa: C901, PLR0915
     """Join exact exported relationships; no guessed aliases or access policies.
 
     records contain either item_id/source_urls or digital_object_urls. Each URL
@@ -69,10 +71,16 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):
         for url in evidence['record_urls']:
             url_items.setdefault(normalized_source(url), set()).add(name)
         if not matches:
-            outcomes[name] = ('Missing source mapping', 'Export the Compass alias-to-node relationship and retain its manifest.')
+            outcomes[name] = (
+                'Missing source mapping',
+                'Export the Compass alias-to-node relationship and retain its manifest.',
+            )
             continue
         if len(matches) != 1:
-            outcomes[name] = ('Ambiguous source mapping', 'Conflicting Compass source records match this object; reconcile the export.')
+            outcomes[name] = (
+                'Ambiguous source mapping',
+                'Conflicting Compass source records match this object; reconcile the export.',
+            )
             continue
         source = snapshot['sources'][next(iter(matches))]
         for url in aliases(source):
@@ -80,7 +88,10 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):
         try:
             raw = bounded_file(contained(source_root, source['source_file']))
         except FileNotFoundError:
-            outcomes[name] = ('Missing retained source', 'Retain the Compass manifest in source_root, then rerun intake.')
+            outcomes[name] = (
+                'Missing retained source',
+                'Retain the Compass manifest in source_root, then rerun intake.',
+            )
             continue
         except (OSError, ValueError, KeyError) as error:
             outcomes[name] = ('Invalid source manifest', str(error))
@@ -93,26 +104,52 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):
             node = str(source['node_id'])
             if manifest.get('@id') != 'https://compass.fivecolleges.edu/node/' + node + '/manifest':
                 raise ValueError('Manifest identity differs from exported Compass node')
-            identifiers = [m.get('value') for m in manifest.get('metadata', []) if m.get('label') == 'Identifier']
+            identifiers = [
+                m.get('value')
+                for m in manifest.get('metadata', [])
+                if m.get('label') == 'Identifier'
+            ]
             if identifiers and any(value != name for value in identifiers):
-                raise ValueError('Manifest Identifier disagrees with ArchivesSpace digital-object identifier')
+                raise ValueError(
+                    'Manifest Identifier disagrees with ArchivesSpace digital-object identifier'
+                )
             sequences = manifest.get('sequences', [])
             if len(sequences) == 1 and not sequences[0].get('canvases'):
-                raise ValueError('Compass manifest has no pages; repair or export the source before conversion')
-            _, details = convert(manifest, config['manifest_base'].rstrip('/') + '/' + name + '.json', config['image_base'])
+                raise ValueError(
+                    'Compass manifest has no pages; repair or export the source before conversion'
+                )
+            _, details = convert(
+                manifest,
+                config['manifest_base'].rstrip('/') + '/' + name + '.json',
+                config['image_base'],
+            )
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             outcomes[name] = ('Invalid source manifest', str(error))
             continue
         previous = existing.get(name, {})
-        if previous and (str(previous.get('node_id')) != node or
-                         previous.get('source_sha256') != checksum):
-            outcomes[name] = ('Inventory conflict', 'Existing source identity or checksum changed; review replacement before installing inventory.')
+        if previous and (
+            str(previous.get('node_id')) != node or previous.get('source_sha256') != checksum
+        ):
+            outcomes[name] = (
+                'Inventory conflict',
+                'Existing source identity or checksum changed; review replacement before '
+                'installing inventory.',
+            )
             continue
         candidate = copy.deepcopy(previous)
         candidate.pop('intake_hold', None)
-        candidate.update(node_id=node, source_file=source['source_file'], source_sha256=checksum,
-                         source_urls=sorted(set(previous.get('source_urls', [])) | evidence['source_urls'] | evidence['record_urls'] | set(source.get('source_urls', []))),
-                         intake_snapshot_sha256=snapshot_hash)
+        candidate.update(
+            node_id=node,
+            source_file=source['source_file'],
+            source_sha256=checksum,
+            source_urls=sorted(
+                set(previous.get('source_urls', []))
+                | evidence['source_urls']
+                | evidence['record_urls']
+                | set(source.get('source_urls', []))
+            ),
+            intake_snapshot_sha256=snapshot_hash,
+        )
         candidate.setdefault('original_uri', sorted(evidence['source_urls'])[0])
         candidate.setdefault('aspace_record', sorted(evidence['record_urls'])[0])
         approval = approvals.get(name, {})
@@ -122,10 +159,23 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):
         inventory[name] = candidate
         if name in config.get('withdrawn_items', []):
             outcomes[name] = ('Withdrawn', 'Item is withdrawn; do not publish.')
-        elif candidate.get('access') != 'public' or not candidate.get('policy') or not candidate.get('approved_by'):
-            outcomes[name] = ('Awaiting access approval', 'Mapping and manifest structure verified; operator public-access approval is required.')
+        elif (
+            candidate.get('access') != 'public'
+            or not candidate.get('policy')
+            or not candidate.get('approved_by')
+        ):
+            outcomes[name] = (
+                'Awaiting access approval',
+                'Mapping and manifest structure verified; operator public-access approval '
+                'is required.',
+            )
         else:
-            outcomes[name] = ('Ready', str(len(details['pages'])) + ' pages structurally validated; run the worker dry run to verify image services before publication.')
+            outcomes[name] = (
+                'Ready',
+                str(len(details['pages']))
+                + ' pages structurally validated; run the worker dry run to verify image '
+                'services before publication.',
+            )
 
     # A parent with missing/ambiguous children must never become a one-item alias
     # merely because only one child survived conversion/approval checks.
@@ -139,10 +189,18 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):
         # Keep old unresolved holds outside this snapshot. A new complete export
         # can clear its own holds. Include derived node URLs used by Sheets.
         previous_blocks = set(candidate.get('blocked_source_keys', [])) - set(url_items)
-        candidate['blocked_source_keys'] = sorted(previous_blocks | (known_aliases & blocked_aliases))
-        candidate['source_urls'] = [url for url in candidate.get('source_urls', [])
-                                    if normalized_source(url) not in blocked_aliases]
-        if candidate.get('original_uri') and normalized_source(candidate['original_uri']) in blocked_aliases:
+        candidate['blocked_source_keys'] = sorted(
+            previous_blocks | (known_aliases & blocked_aliases)
+        )
+        candidate['source_urls'] = [
+            url
+            for url in candidate.get('source_urls', [])
+            if normalized_source(url) not in blocked_aliases
+        ]
+        if (
+            candidate.get('original_uri')
+            and normalized_source(candidate['original_uri']) in blocked_aliases
+        ):
             candidate.pop('original_uri')
 
     report = []
@@ -150,15 +208,31 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):
         try:
             key = normalized_source(url)
         except ValueError as error:
-            report.append({'source_url': url, 'item_ids': [], 'status': 'Invalid request', 'message': str(error)})
+            report.append(
+                {
+                    'source_url': url,
+                    'item_ids': [],
+                    'status': 'Invalid request',
+                    'message': str(error),
+                }
+            )
             continue
         names = sorted(url_items.get(key, set()))
         if key in incomplete:
-            status, message = 'Incomplete relationship export', 'Export every linked digital object before resolving this parent record.'
+            status, message = (
+                'Incomplete relationship export',
+                'Export every linked digital object before resolving this parent record.',
+            )
         elif not names:
-            status, message = 'Unmapped source', 'Include this URL and its linked digital objects in the relationship export.'
+            status, message = (
+                'Unmapped source',
+                'Include this URL and its linked digital objects in the relationship export.',
+            )
         elif len(names) > 1:
-            status, message = 'Ambiguous source', 'This URL refers to several digital objects; submit their individual URLs.'
+            status, message = (
+                'Ambiguous source',
+                'This URL refers to several digital objects; submit their individual URLs.',
+            )
         else:
             status, message = outcomes[names[0]]
         report.append({'source_url': url, 'item_ids': names, 'status': status, 'message': message})
@@ -170,20 +244,30 @@ def main(argv=None):
     parser.add_argument('--snapshot', type=Path, required=True)
     parser.add_argument('--source-root', type=Path, required=True)
     parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--requests', type=Path, required=True, help='Requests CSV with the Sheet column headers')
+    parser.add_argument(
+        '--requests', type=Path, required=True, help='Requests CSV with the Sheet column headers'
+    )
     parser.add_argument('--approvals', type=Path, help='Explicit per-item public-access decisions')
     parser.add_argument('--existing-inventory', type=Path)
-    parser.add_argument('--output', type=Path, required=True, help='New private directory; never the live inventory')
+    parser.add_argument(
+        '--output', type=Path, required=True, help='New private directory; never the live inventory'
+    )
     args = parser.parse_args(argv)
+
     def read(path):
         return load_json(bounded_file(path))
+
     with args.requests.open(newline='', encoding='utf-8-sig') as stream:
         requests = parse_requests(list(csv.reader(stream)))
     snapshot = read(args.snapshot)
-    inventory, report = prepare(snapshot, args.source_root, read(args.config),
-                                [r['source_url'] for r in requests if r['enabled']],
-                                read(args.approvals) if args.approvals else {},
-                                read(args.existing_inventory) if args.existing_inventory else {})
+    inventory, report = prepare(
+        snapshot,
+        args.source_root,
+        read(args.config),
+        [r['source_url'] for r in requests if r['enabled']],
+        read(args.approvals) if args.approvals else {},
+        read(args.existing_inventory) if args.existing_inventory else {},
+    )
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
     atomic_write(args.output / 'inventory.candidate.json', encode(inventory))
     atomic_write(args.output / 'preflight.json', encode(report))

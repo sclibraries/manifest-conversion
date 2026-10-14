@@ -1,4 +1,5 @@
 """Pure, deliberately narrow IIIF Presentation 2 conversion."""
+
 import copy
 import hashlib
 import json
@@ -37,28 +38,41 @@ def encode(value):
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + '\n').encode()
 
 
-def load_json(data, limit=8*1024*1024):
+def load_json(data, limit=8 * 1024 * 1024):  # noqa: C901
     if len(data) > limit:
         raise ValueError('JSON byte limit exceeded')
     # Check nesting before invoking the recursive JSON decoder, respecting strings.
-    depth = 0; quoted = False; escaped = False
+    depth = 0
+    quoted = False
+    escaped = False
     for char in data.decode('utf-8'):
         if quoted:
-            if escaped: escaped = False
-            elif char == '\\': escaped = True
-            elif char == '"': quoted = False
-        elif char == '"': quoted = True
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
         elif char in '[{':
             depth += 1
-            if depth > 32: raise ValueError('JSON nesting limit exceeded')
-        elif char in ']}': depth -= 1
+            if depth > 32:
+                raise ValueError('JSON nesting limit exceeded')
+        elif char in ']}':
+            depth -= 1
+
     def pairs(items):
         result = {}
         for key, value in items:
-            if key in result: raise ValueError('duplicate JSON key')
+            if key in result:
+                raise ValueError('duplicate JSON key')
             result[key] = value
         return result
-    def invalid(value): raise ValueError('non-finite JSON number')
+
+    def invalid(value):
+        raise ValueError('non-finite JSON number')
+
     return json.loads(data, object_pairs_hook=pairs, parse_constant=invalid)
 
 
@@ -66,7 +80,14 @@ def https_url(url):
     if not isinstance(url, str):
         raise ValueError('expected HTTPS URL text')
     parsed = urlsplit(url)
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None,443) or parsed.fragment:
+    if (
+        parsed.scheme != 'https'
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.port not in (None, 443)
+        or parsed.fragment
+    ):
         raise ValueError('expected HTTPS URL without credentials or fragment')
     return parsed
 
@@ -75,88 +96,144 @@ def image_key(service):
     parsed = https_url(service)
     if parsed.hostname != COMPASS or '/iiif/2/' not in parsed.path or parsed.query:
         raise ValueError('unsupported source image service')
-    source = urlsplit(unquote(parsed.path.split('/iiif/2/',1)[1]))
-    if source.scheme not in ('http','https') or source.hostname != COMPASS or not source.path.startswith('/system/files/') or source.query or source.fragment:
+    source = urlsplit(unquote(parsed.path.split('/iiif/2/', 1)[1]))
+    if (
+        source.scheme not in ('http', 'https')
+        or source.hostname != COMPASS
+        or not source.path.startswith('/system/files/')
+        or source.query
+        or source.fragment
+    ):
         raise ValueError('image source is not an explicit Compass file mapping')
-    key = unquote(source.path[len('/system/files/'):])
-    if not key or any(part in ('', '.', '..') for part in key.split('/')) or any(ord(c)<32 for c in key):
+    key = unquote(source.path[len('/system/files/') :])
+    if (
+        not key
+        or any(part in ('', '.', '..') for part in key.split('/'))
+        or any(ord(c) < 32 for c in key)
+    ):
         raise ValueError('invalid image key')
     return key
 
 
 def check_fields(obj, allowed):
-    if not isinstance(obj, dict) or set(obj)-set(allowed.split()):
+    if not isinstance(obj, dict) or set(obj) - set(allowed.split()):
         raise ValueError('unsupported manifest fields; review required')
 
 
-def convert(source, canonical, image_base):
-    https_url(canonical); https_url(image_base)
+def convert(source, canonical, image_base):  # noqa: C901, PLR0915
+    https_url(canonical)
+    https_url(image_base)
     result = copy.deepcopy(source)
-    check_fields(result, '@context @id @type label description attribution license metadata logo thumbnail sequences service behavior')
-    if result.get('@type') != 'sc:Manifest' or result.get('@context') != 'http://iiif.io/api/presentation/2/context.json':
+    check_fields(
+        result,
+        '@context @id @type label description attribution license metadata logo '
+        'thumbnail sequences service behavior',
+    )
+    if (
+        result.get('@type') != 'sc:Manifest'
+        or result.get('@context') != 'http://iiif.io/api/presentation/2/context.json'
+    ):
         raise ValueError('only IIIF Presentation 2 image manifests are supported')
-    sequences=result.get('sequences',[])
-    if len(sequences)!=1: raise ValueError('expected exactly one sequence')
-    sequence=sequences[0]
+    sequences = result.get('sequences', [])
+    if len(sequences) != 1:
+        raise ValueError('expected exactly one sequence')
+    sequence = sequences[0]
     check_fields(sequence, '@id @type @context label canvases viewingHint viewingDirection')
-    canvases=sequence.get('canvases',[])
-    if not 1 <= len(canvases) <= 2000: raise ValueError('page count outside 1–2000')
-    result['@id']=canonical
-    sequence['@id']=canonical+'/sequence/normal'
-    receipt={'pages':[], 'omitted_hocr_links':[], 'omitted_search_services':[]}
+    canvases = sequence.get('canvases', [])
+    if not 1 <= len(canvases) <= 2000:
+        raise ValueError('page count outside 1–2000')
+    result['@id'] = canonical
+    sequence['@id'] = canonical + '/sequence/normal'
+    receipt = {'pages': [], 'omitted_hocr_links': [], 'omitted_search_services': []}
     if 'service' in result:
-        services=result['service']
-        if not isinstance(services,list) or any(not isinstance(v,dict) or
-                v.get('profile')!='http://iiif.io/api/search/0/search' for v in services):
+        services = result['service']
+        if not isinstance(services, list) or any(
+            not isinstance(v, dict) or v.get('profile') != 'http://iiif.io/api/search/0/search'
+            for v in services
+        ):
             raise ValueError('unsupported manifest service; review required')
-        receipt['omitted_search_services']=result.pop('service')
-    seen=set()
+        receipt['omitted_search_services'] = result.pop('service')
+    seen = set()
     for canvas in canvases:
         check_fields(canvas, '@id @type label width height images thumbnail metadata seeAlso')
-        identity=canvas.get('@id',''); https_url(identity)
-        if identity in seen: raise ValueError('duplicate canvas')
+        identity = canvas.get('@id', '')
+        https_url(identity)
+        if identity in seen:
+            raise ValueError('duplicate canvas')
         seen.add(identity)
-        if canvas.get('@type')!='sc:Canvas': raise ValueError('invalid canvas type')
-        for dimension in ('width','height'):
+        if canvas.get('@type') != 'sc:Canvas':
+            raise ValueError('invalid canvas type')
+        for dimension in ('width', 'height'):
             if type(canvas.get(dimension)) is not int or not 0 < canvas[dimension] <= 100000:
                 raise ValueError('invalid canvas dimensions')
-        annotations=canvas.get('images',[])
-        if len(annotations)!=1: raise ValueError('expected one painting per page')
-        annotation=annotations[0]
-        check_fields(annotation,'@id @type motivation resource on')
-        if annotation.get('on')!=identity or annotation.get('motivation')!='sc:painting':
+        annotations = canvas.get('images', [])
+        if len(annotations) != 1:
+            raise ValueError('expected one painting per page')
+        annotation = annotations[0]
+        check_fields(annotation, '@id @type motivation resource on')
+        if annotation.get('on') != identity or annotation.get('motivation') != 'sc:painting':
             raise ValueError('annotation target or motivation mismatch')
-        resource=annotation['resource']
-        check_fields(resource,'@id @type format width height service')
-        if resource.get('@type')!='dctypes:Image': raise ValueError('unsupported media type')
-        service=resource.get('service')
-        check_fields(service,'@id @context profile')
-        key=image_key(service['@id'])
+        resource = annotation['resource']
+        check_fields(resource, '@id @type format width height service')
+        if resource.get('@type') != 'dctypes:Image':
+            raise ValueError('unsupported media type')
+        service = resource.get('service')
+        check_fields(service, '@id @context profile')
+        key = image_key(service['@id'])
         # Same encoded-key convention as workbench_lite.manifest.build_cantaloupe_service_id.
-        target=image_base.rstrip('/')+'/'+quote(key,safe='')
-        resource.update({'@id':target+'/full/full/0/default.jpg','format':'image/jpeg',
-                         'width':canvas['width'],'height':canvas['height'],
-                         'service':{'@id':target,'@context':'http://iiif.io/api/image/2/context.json',
-                                    'profile':'http://iiif.io/api/image/2/level2.json'}})
-        canvas['thumbnail']={'@id':target+'/full/!300,300/0/default.jpg','format':'image/jpeg'}
+        target = image_base.rstrip('/') + '/' + quote(key, safe='')
+        resource.update(
+            {
+                '@id': target + '/full/full/0/default.jpg',
+                'format': 'image/jpeg',
+                'width': canvas['width'],
+                'height': canvas['height'],
+                'service': {
+                    '@id': target,
+                    '@context': 'http://iiif.io/api/image/2/context.json',
+                    'profile': 'http://iiif.io/api/image/2/level2.json',
+                },
+            }
+        )
+        canvas['thumbnail'] = {
+            '@id': target + '/full/!300,300/0/default.jpg',
+            'format': 'image/jpeg',
+        }
         if 'seeAlso' in canvas:
-            link=canvas['seeAlso']
-            if not isinstance(link,dict) or link.get('format')!='text/vnd.hocr+html':
+            link = canvas['seeAlso']
+            if not isinstance(link, dict) or link.get('format') != 'text/vnd.hocr+html':
                 raise ValueError('unsupported companion link; review required')
-            receipt['omitted_hocr_links'].append({'canvas':identity,'source':canvas.pop('seeAlso')})
-        receipt['pages'].append({'canvas':identity,'image_key':key,'service':target,
-                                  'width':canvas['width'],'height':canvas['height']})
-    result['thumbnail']=canvases[0]['thumbnail']
+            receipt['omitted_hocr_links'].append(
+                {'canvas': identity, 'source': canvas.pop('seeAlso')}
+            )
+        receipt['pages'].append(
+            {
+                'canvas': identity,
+                'image_key': key,
+                'service': target,
+                'width': canvas['width'],
+                'height': canvas['height'],
+            }
+        )
+    result['thumbnail'] = canvases[0]['thumbnail']
+
     # Metadata is text, never trusted HTML. Reject markup rather than silently altering it.
     def inspect(value, key=''):
-        if isinstance(value,dict):
-            for k,v in value.items(): inspect(v,k)
-        elif isinstance(value,list):
-            for v in value: inspect(v,key)
-        elif isinstance(value,str):
-            if '<' in value or '>' in value: raise ValueError('markup requires metadata review')
-            if key not in ('@id','@context','on','profile') and ('javascript:' in value.lower() or 'data:' in value.lower()):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                inspect(v, k)
+        elif isinstance(value, list):
+            for v in value:
+                inspect(v, key)
+        elif isinstance(value, str):
+            if '<' in value or '>' in value:
+                raise ValueError('markup requires metadata review')
+            if key not in ('@id', '@context', 'on', 'profile') and (
+                'javascript:' in value.lower() or 'data:' in value.lower()
+            ):
                 raise ValueError('unsafe metadata URI')
+
     inspect(result)
-    if 'logo' in result: raise ValueError('logo delivery requires explicit review')
-    return result,receipt
+    if 'logo' in result:
+        raise ValueError('logo delivery requires explicit review')
+    return result, receipt

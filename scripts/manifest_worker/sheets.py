@@ -1,4 +1,5 @@
 """One-run Google Sheets queue. Conversion defaults to local dry-run mode."""
+
 import argparse
 import fcntl
 import json
@@ -10,12 +11,26 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .core import contained, digest, encode, https_url, load_json, safe_id
-from .runner import atomic_write, bounded_file, run_item, publication_allowed, validate_discovered_item
+from .runner import (
+    atomic_write,
+    bounded_file,
+    run_item,
+    publication_allowed,
+    validate_discovered_item,
+)
 from .transport import Fetcher
 from .urls import normalized_source, ASPACE_HOSTS
 
 REQUEST_HEADERS = ['Request ID', 'Source URL', 'Notes', 'Ready']
-RESULT_HEADERS = ['Request ID', 'Source URL', 'Status', 'Manifest URL', 'Last Run', 'Result', 'Operation ID']
+RESULT_HEADERS = [
+    'Request ID',
+    'Source URL',
+    'Status',
+    'Manifest URL',
+    'Last Run',
+    'Result',
+    'Operation ID',
+]
 
 
 class UnmappedSource(ValueError):
@@ -27,7 +42,11 @@ def _spreadsheet_id(value):
     if value.startswith(prefix):
         parsed = urlsplit(value)
         path = parsed.path.split('/')
-        if parsed.netloc != 'docs.google.com' or path[1:3] != ['spreadsheets', 'd'] or len(path) < 4:
+        if (
+            parsed.netloc != 'docs.google.com'
+            or path[1:3] != ['spreadsheets', 'd']
+            or len(path) < 4
+        ):
             raise ValueError('Invalid spreadsheet ID')
         value = path[3]
     if not re.fullmatch(r'[A-Za-z0-9_-]{20,100}', value):
@@ -47,7 +66,7 @@ def parse_requests(values):
             continue
         if len(cells) > 4:
             raise ValueError('Unexpected request columns')
-        cells = [str(value) for value in cells] + [''] * (4-len(cells))
+        cells = [str(value) for value in cells] + [''] * (4 - len(cells))
         name = safe_id(cells[0].strip())
         if name in seen:
             raise ValueError('Duplicate Request ID: ' + name)
@@ -55,39 +74,62 @@ def parse_requests(values):
         if len(cells[1]) > 2048 or len(cells[2]) > 2000:
             raise ValueError('Source URL or Notes exceeds limit')
         ready = cells[3].strip().upper()
-        if ready not in ('', 'FALSE', 'NO', 'TRUE', 'YES', 'READY') and not re.fullmatch(r'RETRY:[1-9][0-9]{0,5}', ready):
+        if ready not in ('', 'FALSE', 'NO', 'TRUE', 'YES', 'READY') and not re.fullmatch(
+            r'RETRY:[1-9][0-9]{0,5}', ready
+        ):
             raise ValueError('Ready must be TRUE, FALSE, or RETRY:1 (increment for another retry)')
-        rows.append({'request_id':name, 'source_url':cells[1].strip(), 'notes':cells[2],
-                     'ready':ready, 'enabled':ready in ('TRUE','YES','READY') or ready.startswith('RETRY:')})
+        rows.append(
+            {
+                'request_id': name,
+                'source_url': cells[1].strip(),
+                'notes': cells[2],
+                'ready': ready,
+                'enabled': ready in ('TRUE', 'YES', 'READY') or ready.startswith('RETRY:'),
+            }
+        )
     return rows
 
 
-def approved_item(source, inventory, config):
+def approved_item(source, inventory, config):  # noqa: C901
     key = normalized_source(source)
     matches = []
     for name, record in inventory.items():
         if key in record.get('blocked_source_keys', []):
-            raise ValueError('Ambiguous or incomplete source: reconcile the relationship export or submit an individual digital-object URL.')
+            raise ValueError(
+                'Ambiguous or incomplete source: reconcile the relationship export or submit '
+                'an individual digital-object URL.'
+            )
         aliases = list(record.get('source_urls', []))
         if record.get('original_uri'):
             aliases.append(record['original_uri'])
         node = str(record.get('node_id', ''))
         if node.isascii() and node.isdigit():
-            aliases += ['https://compass.fivecolleges.edu/node/'+node,
-                        'https://compass.fivecolleges.edu/node/'+node+'/manifest']
+            aliases += [
+                'https://compass.fivecolleges.edu/node/' + node,
+                'https://compass.fivecolleges.edu/node/' + node + '/manifest',
+            ]
         if any(normalized_source(alias) == key for alias in aliases):
             matches.append(dict(record, item_id=safe_id(name)))
     if not matches:
-        raise UnmappedSource('Unmapped source: include this URL and its linked digital objects in the relationship export, then run intake.')
+        raise UnmappedSource(
+            'Unmapped source: include this URL and its linked digital objects in the '
+            'relationship export, then run intake.'
+        )
     if len(matches) > 1:
-        raise ValueError('Ambiguous source: matches ' + str(len(matches)) + ' inventory entries; reconcile the mapping or submit individual digital-object URLs.')
+        raise ValueError(
+            'Ambiguous source: matches '
+            + str(len(matches))
+            + ' inventory entries; reconcile the mapping or submit individual digital-object URLs.'
+        )
     item = matches[0]
     if item.get('intake_hold'):
         raise ValueError('Intake hold: ' + item['intake_hold'])
     if item['item_id'] in config.get('withdrawn_items', []):
         raise ValueError('Item is withdrawn; do not republish')
     if item.get('access') != 'public' or not item.get('policy') or not item.get('approved_by'):
-        raise ValueError(item['item_id'] + ': mapping found; operator public-access approval is missing.')
+        raise ValueError(
+            item['item_id'] + ': mapping found; operator public-access approval is missing.'
+        )
     return item
 
 
@@ -105,24 +147,42 @@ def result_keys(values):
     return keys
 
 
-def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run_item, limit=10,
-                  resolver=None, validator=validate_discovered_item):
+def process_queue(  # noqa: C901, PLR0915
+    sheet,
+    config,
+    inventory,
+    publish,
+    fetch,
+    sheet_id,
+    worker=run_item,
+    limit=10,
+    resolver=None,
+    validator=validate_discovered_item,
+):
     options = config.get('discovery', {})
     if not isinstance(options, dict) or not isinstance(options.get('enabled', False), bool):
         raise ValueError('discovery must be an object with a Boolean enabled setting')
     approval = options.get('ready_publication', {})
-    if not isinstance(approval, dict) or (approval and any(not isinstance(approval.get(field), str) or not approval[field].strip()
-                                                        for field in ('policy', 'approved_by'))):
-        raise ValueError('ready_publication must be an object with a policy and approving authority, or omitted')
+    if not isinstance(approval, dict) or (
+        approval
+        and any(
+            not isinstance(approval.get(field), str) or not approval[field].strip()
+            for field in ('policy', 'approved_by')
+        )
+    ):
+        raise ValueError(
+            'ready_publication must be an object with a policy and approving authority, or omitted'
+        )
     if resolver is None:
         from .discovery import discover
+
         resolver = discover
     rows = parse_requests(sheet.read_requests())
     keys = result_keys(sheet.read_results())
     state = Path(config['state_dir']).resolve()
     ledger = contained(state, 'sheet-' + digest(sheet_id.encode())[:24])
     ledger.mkdir(parents=True, exist_ok=True)
-    summary = {'processed':0, 'skipped':0, 'reconciled':0, 'failed':0, 'needs_review':0}
+    summary = {'processed': 0, 'skipped': 0, 'reconciled': 0, 'failed': 0, 'needs_review': 0}
     for request in rows:
         if not request['enabled']:
             continue
@@ -137,17 +197,37 @@ def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run
                 options = config.get('discovery', {})
                 if not options.get('enabled'):
                     raise
-                item = resolver(request['source_url'], config, fetch, inventory, retry_token=request['ready'])
+                item = resolver(
+                    request['source_url'], config, fetch, inventory, retry_token=request['ready']
+                )
                 approval = options.get('ready_publication', {})
-                if not publication_allowed(item) and approval.get('policy') and approval.get('approved_by'):
-                    item = dict(item, access='public', policy=approval['policy'], approved_by=approval['approved_by'])
+                if (
+                    not publication_allowed(item)
+                    and approval.get('policy')
+                    and approval.get('approved_by')
+                ):
+                    item = dict(
+                        item,
+                        access='public',
+                        policy=approval['policy'],
+                        approved_by=approval['approved_by'],
+                    )
                 approval_required = not publication_allowed(item)
         except ValueError as error:
             item = None
             review_error = str(error)
         # Mode/config/approval changes are new operations; row positions never identify work.
-        fingerprint = digest(encode({'request':request, 'item':item, 'review':review_error,
-                                     'publish':publish, 'config':config}))
+        fingerprint = digest(
+            encode(
+                {
+                    'request': request,
+                    'item': item,
+                    'review': review_error,
+                    'publish': publish,
+                    'config': config,
+                }
+            )
+        )
         path = contained(ledger, fingerprint + '.json')
         previous = load_json(bounded_file(path)) if path.exists() else None
         if fingerprint in keys:
@@ -164,8 +244,16 @@ def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run
         current = parse_requests(sheet.read_requests())
         if request not in current:
             continue
-        atomic_write(path, encode({'request':request, 'mode':'publish' if publish else 'dry-run',
-                                   'status':'processing'}))
+        atomic_write(
+            path,
+            encode(
+                {
+                    'request': request,
+                    'mode': 'publish' if publish else 'dry-run',
+                    'status': 'processing',
+                }
+            ),
+        )
         url = ''
         if review_error:
             status = 'Needs review'
@@ -176,9 +264,17 @@ def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run
                 operation = validator if approval_required else worker
                 receipt = operation(item, config, publish and not approval_required, fetch)
                 url = receipt['manifest_url']
-                status = 'Validated (approval required)' if approval_required else ('Published' if publish else 'Validated (dry run)')
+                status = (
+                    'Validated (approval required)'
+                    if approval_required
+                    else ('Published' if publish else 'Validated (dry run)')
+                )
                 message = str(len(receipt['pages'])) + ' pages validated. '
-                message += 'HTTPS publication verified.' if publish and not approval_required else 'Manifest staged locally; URL is proposed, not published.'
+                message += (
+                    'HTTPS publication verified.'
+                    if publish and not approval_required
+                    else 'Manifest staged locally; URL is proposed, not published.'
+                )
                 if approval_required:
                     message += ' Public-publication approval is required.'
                     summary['needs_review'] += 1
@@ -186,27 +282,45 @@ def process_queue(sheet, config, inventory, publish, fetch, sheet_id, worker=run
                 status = 'Failed'
                 message = str(error)[:500]
                 summary['failed'] += 1
-        result = [request['request_id'], request['source_url'], status, url,
-                  datetime.now(timezone.utc).isoformat(), message, fingerprint]
+        result = [
+            request['request_id'],
+            request['source_url'],
+            status,
+            url,
+            datetime.now(timezone.utc).isoformat(),
+            message,
+            fingerprint,
+        ]
         # Save result before Google I/O. A failed status write never needs reconversion.
-        atomic_write(path, encode({'request':request, 'status':'completed', 'result':result}))
+        atomic_write(path, encode({'request': request, 'status': 'completed', 'result': result}))
         latest = parse_requests(sheet.read_requests())
         if request not in latest:
-            result[5] += ' Request changed or was removed during processing; this result applies to the recorded source.'
-            atomic_write(path, encode({'request':request, 'status':'completed', 'result':result}))
+            result[5] += (
+                ' Request changed or was removed during processing; this result applies to '
+                'the recorded source.'
+            )
+            atomic_write(
+                path, encode({'request': request, 'status': 'completed', 'result': result})
+            )
         sheet.append_result(result)
         keys.add(fingerprint)
         summary['processed'] += 1
     return summary
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description='Read Ready Sheet rows, convert locally, and append results. Default: dry run.')
+def main(argv=None):  # noqa: C901, PLR0915
+    parser = argparse.ArgumentParser(
+        description='Read Ready Sheet rows, convert locally, and append results. Default: dry run.'
+    )
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--sheet', required=True, help='Spreadsheet ID or URL')
     parser.add_argument('--requests-tab', default='Requests')
     parser.add_argument('--results-tab', default='Results')
-    parser.add_argument('--credentials', type=Path, help='Service-account JSON; otherwise GOOGLE_APPLICATION_CREDENTIALS')
+    parser.add_argument(
+        '--credentials',
+        type=Path,
+        help='Service-account JSON; otherwise GOOGLE_APPLICATION_CREDENTIALS',
+    )
     parser.add_argument('--initialize-results', action='store_true')
     parser.add_argument('--publish', action='store_true')
     parser.add_argument('--limit', type=int, default=10)
@@ -220,28 +334,29 @@ def main(argv=None):
     if not credential_path:
         raise ValueError('Set GOOGLE_APPLICATION_CREDENTIALS or pass --credentials')
     config = load_json(bounded_file(args.config))
-    for name in ('source_root','state_dir','inventory'):
+    for name in ('source_root', 'state_dir', 'inventory'):
         if not Path(config[name]).is_absolute():
-            raise ValueError(name+' must be absolute')
-    for name in ('manifest_base','image_base'):
+            raise ValueError(name + ' must be absolute')
+    for name in ('manifest_base', 'image_base'):
         if https_url(config[name]).query:
-            raise ValueError(name+' cannot include query parameters')
+            raise ValueError(name + ' cannot include query parameters')
     inventory = load_json(bounded_file(Path(config['inventory'])))
-    if not isinstance(inventory,dict):
+    if not isinstance(inventory, dict):
         raise ValueError('Inventory must be an object')
     state = Path(config['state_dir']).resolve()
-    state.mkdir(parents=True,exist_ok=True)
-    os.chmod(state,0o700)
+    state.mkdir(parents=True, exist_ok=True)
+    os.chmod(state, 0o700)
     if args.publish:
         destination = Path(config['publish_dir']).resolve()
         if state.is_relative_to(destination) or destination.is_relative_to(state):
             raise ValueError('Public destination and private state must be separate')
     from .sheets_api import GoogleSheet
-    with contained(state,'worker.lock').open('a') as lock:
+
+    with contained(state, 'worker.lock').open('a') as lock:
         try:
-            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ValueError('Another worker holds the state lock')
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError('Another worker holds the state lock') from error
         sheet = GoogleSheet(sheet_id, credential_path, args.requests_tab, args.results_tab)
         if args.initialize_results:
             sheet.initialize_results()
@@ -249,7 +364,9 @@ def main(argv=None):
         if config.get('discovery', {}).get('enabled'):
             hosts.update(config['discovery'].get('aspace_public_hosts', ASPACE_HOSTS))
         fetch = Fetcher(hosts)
-        result = process_queue(sheet,config,inventory,args.publish,fetch,sheet_id,limit=args.limit)
+        result = process_queue(
+            sheet, config, inventory, args.publish, fetch, sheet_id, limit=args.limit
+        )
     result.update(published_mode=args.publish, requests=fetch.requests, bytes=fetch.bytes)
     print(json.dumps(result))
     return 1 if result['failed'] or result['needs_review'] else 0
@@ -258,6 +375,6 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ValueError,OSError,KeyError,TypeError,ImportError) as error:
-        print('manifest-sheets: '+str(error),file=sys.stderr)
+    except (ValueError, OSError, KeyError, TypeError, ImportError) as error:
+        print('manifest-sheets: ' + str(error), file=sys.stderr)
         sys.exit(2)
