@@ -57,7 +57,7 @@ def validate_discovered_item(item, config, publish, fetch):
     return run_item(item, config, False, fetch, validation_only=True)
 
 
-def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C901, PLR0915
+def _validate_item(item, config, publish, validation_only):
     name = safe_id(item['item_id'])
     if validation_only and publish:
         raise ValueError('Discovery validation cannot publish')
@@ -71,6 +71,10 @@ def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C
     if not str(node).isdigit():
         raise ValueError('exported numeric node mapping required')
     source_url = f'https://{COMPASS}/node/{node}/manifest'
+    return name, node, source_url
+
+
+def _load_source(item, config, fetch, source_url):
     if item.get('source_file'):
         raw = bounded_file(contained(config['source_root'], item['source_file']))
         if not item.get('source_sha256'):
@@ -87,9 +91,10 @@ def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C
     source = load_json(raw)
     if source.get('@id') != source_url:
         raise ValueError('manifest does not match approved node')
-    canonical = config['manifest_base'].rstrip('/') + '/' + name + '.json'
-    https_url(canonical)
-    converted, details = convert(source, canonical, config['image_base'])
+    return raw, source
+
+
+def _validate_images(details, fetch):
     for page in details['pages']:
         data, _ = fetch(page['service'] + '/info.json')
         info = load_json(data)
@@ -97,16 +102,10 @@ def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C
             raise ValueError('image dimensions do not match canvas')
         if info.get('@id', info.get('id')) != page['service']:
             raise ValueError('image service identifier mismatch')
-    state = Path(config['state_dir']).resolve()
-    state.mkdir(parents=True, exist_ok=True)
-    for directory in ('artifacts', 'sources', 'receipts', 'history'):
-        contained(state, directory).mkdir(exist_ok=True)
-    data = encode(converted)
-    checksum = digest(data)
-    artifact = contained(state, 'artifacts/' + name + '.json')
-    receipt_path = contained(state, 'receipts/' + name + '.json')
-    previous = load_json(bounded_file(receipt_path)) if receipt_path.exists() else {}
-    receipt = {
+
+
+def _create_receipt(item, name, node, source_url, raw, canonical, checksum, details):
+    return {
         'item_id': name,
         'node_id': str(node),
         'source_uri': source_url,
@@ -122,14 +121,32 @@ def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C
         'timestamp': datetime.now(timezone.utc).isoformat(),
         **details,
     }
+
+
+def _stage_artifacts(item, name, node, source_url, raw, converted, canonical, details, config):
+    state = Path(config['state_dir']).resolve()
+    state.mkdir(parents=True, exist_ok=True)
+    for directory in ('artifacts', 'sources', 'receipts', 'history'):
+        contained(state, directory).mkdir(exist_ok=True)
+    data = encode(converted)
+    checksum = digest(data)
+    artifact = contained(state, 'artifacts/' + name + '.json')
+    receipt_path = contained(state, 'receipts/' + name + '.json')
+    previous = load_json(bounded_file(receipt_path)) if receipt_path.exists() else {}
+    receipt = _create_receipt(item, name, node, source_url, raw, canonical, checksum, details)
     atomic_write(contained(state, 'sources/' + name + '-' + digest(raw) + '.json'), raw)
     atomic_write(artifact, data)
-    if not publish:
-        receipt['status'] = 'validated'
-        # A dry run must not replace a publication ownership receipt.
-        atomic_write(contained(state, 'artifacts/' + name + '-validation.json'), encode(receipt))
-        return receipt
-    destination = Path(config['publish_dir']).resolve()
+    return state, data, checksum, receipt_path, previous, receipt
+
+
+def _stage_validation(state, name, receipt):
+    receipt['status'] = 'validated'
+    # A dry run must not replace a publication ownership receipt.
+    atomic_write(contained(state, 'artifacts/' + name + '-validation.json'), encode(receipt))
+    return receipt
+
+
+def _owned_destination(destination, name, data, canonical, previous, state):
     if not destination.is_dir():
         raise ValueError('publish directory must already exist')
     target = contained(destination, name + '.json')
@@ -141,14 +158,10 @@ def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C
         raise ValueError('destination collision or external change; manual reconciliation required')
     if old is not None and old != data:
         atomic_write(contained(state, 'history/' + name + '-' + digest(old) + '.json'), old)
-    # Persist intended ownership before replacement for safe interrupted-run recovery.
-    receipt['status'] = 'publishing'
-    receipt['previous_sha256'] = digest(old) if old else None
-    atomic_write(receipt_path, encode(receipt))
-    if old != data:
-        atomic_write(target, data, 0o644)
-    receipt['status'] = 'published_unverified'
-    atomic_write(receipt_path, encode(receipt))
+    return target, old
+
+
+def _verify_publication(canonical, checksum, config, fetch):
     remote, headers = fetch(canonical)
     headers = {key.lower(): value for key, value in headers.items()}
     if digest(remote) != checksum:
@@ -159,6 +172,22 @@ def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C
     origin = headers.get('access-control-allow-origin', '')
     if origin not in ('*', config.get('pui_origin', '__unset__')):
         raise ValueError('manifest CORS does not allow configured PUI')
+
+
+def _publish_artifact(
+    name, canonical, state, data, checksum, receipt_path, previous, receipt, config, fetch
+):
+    destination = Path(config['publish_dir']).resolve()
+    target, old = _owned_destination(destination, name, data, canonical, previous, state)
+    # Persist intended ownership before replacement for safe interrupted-run recovery.
+    receipt['status'] = 'publishing'
+    receipt['previous_sha256'] = digest(old) if old else None
+    atomic_write(receipt_path, encode(receipt))
+    if old != data:
+        atomic_write(target, data, 0o644)
+    receipt['status'] = 'published_unverified'
+    atomic_write(receipt_path, encode(receipt))
+    _verify_publication(canonical, checksum, config, fetch)
     receipt['status'] = (
         'unchanged'
         if old == data and previous.get('status') in ('published', 'unchanged')
@@ -166,3 +195,20 @@ def run_item(item, config, publish, fetch, *, validation_only=False):  # noqa: C
     )
     atomic_write(receipt_path, encode(receipt))
     return receipt
+
+
+def run_item(item, config, publish, fetch, *, validation_only=False):
+    name, node, source_url = _validate_item(item, config, publish, validation_only)
+    raw, source = _load_source(item, config, fetch, source_url)
+    canonical = config['manifest_base'].rstrip('/') + '/' + name + '.json'
+    https_url(canonical)
+    converted, details = convert(source, canonical, config['image_base'])
+    _validate_images(details, fetch)
+    state, data, checksum, receipt_path, previous, receipt = _stage_artifacts(
+        item, name, node, source_url, raw, converted, canonical, details, config
+    )
+    if not publish:
+        return _stage_validation(state, name, receipt)
+    return _publish_artifact(
+        name, canonical, state, data, checksum, receipt_path, previous, receipt, config, fetch
+    )
