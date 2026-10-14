@@ -39,7 +39,7 @@ def jobs(path):
     return rows, digest(data), pwd.getpwuid(path.stat().st_uid).pw_name
 
 
-def main(argv=None):  # noqa: C901, PLR0915
+def _parse_args(argv):
     parser = argparse.ArgumentParser(
         description='Validate/harvest image manifests; publish only with --publish.'
     )
@@ -48,7 +48,10 @@ def main(argv=None):  # noqa: C901, PLR0915
     inputs.add_argument('--jobs', type=Path)
     inputs.add_argument('--inbox', type=Path)
     parser.add_argument('--publish', action='store_true')
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def _load_config(args):
     config = load_json(bounded_file(args.config))
     # Config and approval inventory are operator-managed, never read from the staff drop folder.
     for key in ('manifest_base', 'image_base'):
@@ -61,15 +64,96 @@ def main(argv=None):  # noqa: C901, PLR0915
     inventory = load_json(bounded_file(Path(config['inventory'])))
     if not isinstance(inventory, dict):
         raise ValueError('inventory must map item IDs to approved metadata')
+    return config, inventory
+
+
+def _prepare_state(config, publish):
     state = Path(config['state_dir']).resolve()
     state.mkdir(parents=True, exist_ok=True)
     os.chmod(state, 0o700)
-    if args.publish:
+    if publish:
         destination = Path(config['publish_dir']).resolve()
         if state.is_relative_to(destination) or destination.is_relative_to(state):
             raise ValueError('state and public destination must be separate directories')
-    fetch = Fetcher(config['allowed_hosts'])
+    return state
+
+
+def _process_item(name, job_hash, submitter, inventory, config, publish, fetch):
+    try:
+        if name not in inventory:
+            raise ValueError('item is not in approved inventory')
+        item = dict(inventory[name], item_id=name)
+        receipt = run_item(item, config, publish, fetch)
+        result = {
+            key: receipt.get(key, '')
+            for key in (
+                'item_id',
+                'status',
+                'manifest_url',
+                'aspace_record',
+                'original_uri',
+                'sha256',
+            )
+        }
+        result.update(job_sha256=job_hash, submitter=submitter, error='')
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        result = {
+            'item_id': name,
+            'status': 'failed',
+            'error': str(error),
+            'job_sha256': job_hash,
+            'submitter': submitter,
+        }
+    return result
+
+
+def _process_job(path, inventory, config, publish, fetch):
     results = []
+    try:
+        names, job_hash, submitter = jobs(path)
+        for name in names:
+            results.append(
+                _process_item(name, job_hash, submitter, inventory, config, publish, fetch)
+            )
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        results.append({'item_id': '', 'status': 'failed', 'error': str(error)})
+    return results
+
+
+def _process_jobs(paths, inventory, config, publish, fetch):
+    results = []
+    for path in paths:
+        results.extend(_process_job(path, inventory, config, publish, fetch))
+    return results
+
+
+def _write_reports(results, state):
+    run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    reports = contained(state, 'reports')
+    reports.mkdir(exist_ok=True)
+    atomic_write(contained(reports, run_id + '.json'), encode(results))
+    stream = io.StringIO()
+    writer = csv.writer(stream)
+    fields = [
+        'item_id',
+        'status',
+        'manifest_url',
+        'aspace_record',
+        'original_uri',
+        'sha256',
+        'submitter',
+        'job_sha256',
+        'error',
+    ]
+    writer.writerow(fields)
+    for row in results:
+        writer.writerow([safe_cell(row.get(key, '')) for key in fields])
+    report = contained(reports, run_id + '.csv')
+    atomic_write(report, stream.getvalue().encode())
+    return report
+
+
+def _run_locked(args, config, inventory, fetch, state):
     # The shared private state directory is the lock scope for all cron/operator invocations.
     with contained(state, 'worker.lock').open('a') as lock:
         try:
@@ -79,59 +163,17 @@ def main(argv=None):  # noqa: C901, PLR0915
         paths = [args.jobs] if args.jobs else sorted(args.inbox.glob('*.csv'))
         if len(paths) > 100:
             raise ValueError('more than 100 ready job files; archive processed jobs')
-        for path in paths:
-            try:
-                names, job_hash, submitter = jobs(path)
-                for name in names:
-                    try:
-                        if name not in inventory:
-                            raise ValueError('item is not in approved inventory')
-                        item = dict(inventory[name], item_id=name)
-                        receipt = run_item(item, config, args.publish, fetch)
-                        result = {
-                            k: receipt.get(k, '')
-                            for k in (
-                                'item_id',
-                                'status',
-                                'manifest_url',
-                                'aspace_record',
-                                'original_uri',
-                                'sha256',
-                            )
-                        }
-                        result.update(job_sha256=job_hash, submitter=submitter, error='')
-                    except (ValueError, OSError, KeyError, TypeError) as error:
-                        result = {
-                            'item_id': name,
-                            'status': 'failed',
-                            'error': str(error),
-                            'job_sha256': job_hash,
-                            'submitter': submitter,
-                        }
-                    results.append(result)
-            except (ValueError, OSError, KeyError, TypeError) as error:
-                results.append({'item_id': '', 'status': 'failed', 'error': str(error)})
-        run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-        reports = contained(state, 'reports')
-        reports.mkdir(exist_ok=True)
-        atomic_write(contained(reports, run_id + '.json'), encode(results))
-        stream = io.StringIO()
-        writer = csv.writer(stream)
-        fields = [
-            'item_id',
-            'status',
-            'manifest_url',
-            'aspace_record',
-            'original_uri',
-            'sha256',
-            'submitter',
-            'job_sha256',
-            'error',
-        ]
-        writer.writerow(fields)
-        for row in results:
-            writer.writerow([safe_cell(row.get(key, '')) for key in fields])
-        atomic_write(contained(reports, run_id + '.csv'), stream.getvalue().encode())
+        results = _process_jobs(paths, inventory, config, args.publish, fetch)
+        report = _write_reports(results, state)
+    return results, report
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    config, inventory = _load_config(args)
+    state = _prepare_state(config, args.publish)
+    fetch = Fetcher(config['allowed_hosts'])
+    results, report = _run_locked(args, config, inventory, fetch, state)
     failed = sum(row['status'] == 'failed' for row in results)
     print(
         json.dumps(
@@ -140,7 +182,7 @@ def main(argv=None):  # noqa: C901, PLR0915
                 'failed': failed,
                 'requests': fetch.requests,
                 'bytes': fetch.bytes,
-                'report': str(reports / (run_id + '.csv')),
+                'report': str(report),
                 'published_mode': args.publish,
             }
         )
