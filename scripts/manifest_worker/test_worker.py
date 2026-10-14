@@ -54,6 +54,10 @@ def manifest():
 
 
 class CoreTests(unittest.TestCase):
+    def test_json_loader_preserves_full_manifest_shape(self):
+        source = manifest()
+        self.assertEqual(load_json(encode(source)), source)
+
     def test_conversion_preserves_identity_and_reports_ocr_omission(self):
         original = manifest()
         output, receipt = convert(original, BASE + '/sample.json', IMAGE)
@@ -67,6 +71,87 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn('seeAlso', canvas)
         self.assertEqual(len(receipt['omitted_hocr_links']), 1)
         self.assertIn('seeAlso', original['sequences'][0]['canvases'][0])
+
+    def test_conversion_full_manifest_and_details_are_pinned(self):
+        output, details = convert(manifest(), BASE + '/sample.json', IMAGE)
+        target = IMAGE + '/2024-09%2Fpage%20one.tif'
+        canvas = 'https://compass.fivecolleges.edu/node/123/canvas/1'
+        self.assertEqual(
+            output,
+            {
+                '@context': 'http://iiif.io/api/presentation/2/context.json',
+                '@id': BASE + '/sample.json',
+                '@type': 'sc:Manifest',
+                'label': 'Example',
+                'license': 'https://example.org/rights',
+                'sequences': [
+                    {
+                        '@id': BASE + '/sample.json/sequence/normal',
+                        '@type': 'sc:Sequence',
+                        'canvases': [
+                            {
+                                '@id': canvas,
+                                '@type': 'sc:Canvas',
+                                'height': 200,
+                                'images': [
+                                    {
+                                        '@type': 'oa:Annotation',
+                                        'motivation': 'sc:painting',
+                                        'on': canvas,
+                                        'resource': {
+                                            '@id': target + '/full/full/0/default.jpg',
+                                            '@type': 'dctypes:Image',
+                                            'format': 'image/jpeg',
+                                            'height': 200,
+                                            'service': {
+                                                '@context': 'http://iiif.io/api/image/2/context.json',
+                                                '@id': target,
+                                                'profile': 'http://iiif.io/api/image/2/level2.json',
+                                            },
+                                            'width': 100,
+                                        },
+                                    }
+                                ],
+                                'label': 'Page 1',
+                                'thumbnail': {
+                                    '@id': target + '/full/!300,300/0/default.jpg',
+                                    'format': 'image/jpeg',
+                                },
+                                'width': 100,
+                            }
+                        ],
+                    }
+                ],
+                'thumbnail': {
+                    '@id': target + '/full/!300,300/0/default.jpg',
+                    'format': 'image/jpeg',
+                },
+            },
+        )
+        self.assertEqual(
+            details,
+            {
+                'pages': [
+                    {
+                        'canvas': canvas,
+                        'height': 200,
+                        'image_key': '2024-09/page one.tif',
+                        'service': target,
+                        'width': 100,
+                    }
+                ],
+                'omitted_hocr_links': [
+                    {
+                        'canvas': canvas,
+                        'source': {
+                            '@id': 'https://compass.fivecolleges.edu/system/files/page.html',
+                            'format': 'text/vnd.hocr+html',
+                        },
+                    }
+                ],
+                'omitted_search_services': [],
+            },
+        )
 
     def test_legacy_search_service_is_removed_and_recorded(self):
         source = manifest()
