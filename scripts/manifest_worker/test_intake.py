@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .core import encode, digest
+from .core import encode
 from .test_worker import manifest
 from .intake import prepare
 
@@ -53,13 +53,50 @@ class IntakeTests(unittest.TestCase):
 
     def test_join_once_and_reuse_all_proven_aliases(self):
         inventory, report = self.run_intake()
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual([r['status'] for r in report], ['Ready', 'Ready'])
-        self.assertEqual(report[0]['item_ids'], ['sample'])
-        self.assertEqual(set(inventory['sample']['source_urls']), {self.ao, self.do, self.alias})
-        self.assertEqual(inventory['sample']['source_sha256'], digest(encode(self.source)))
         self.assertEqual(
-            inventory['sample']['intake_snapshot_sha256'], digest(encode(self.snapshot))
+            inventory,
+            {
+                'sample': {
+                    'access': 'public',
+                    'approved_by': 'operator',
+                    'aspace_record': self.ao,
+                    'blocked_source_keys': [],
+                    'intake_snapshot_sha256': (
+                        'a7edac15273c2eb8724af4fe0f8742c1abbdbe67d0213850150ba3b176dc6cf9'
+                    ),
+                    'node_id': '123',
+                    'original_uri': self.alias,
+                    'policy': 'example-policy',
+                    'source_file': 'source.json',
+                    'source_sha256': (
+                        'f67bd611e4519bafeeb69a891986d566384aa4dc28c4146945bdcb6064c42824'
+                    ),
+                    'source_urls': [self.alias, self.ao, self.do],
+                }
+            },
+        )
+        self.assertEqual(
+            report,
+            [
+                {
+                    'item_ids': ['sample'],
+                    'message': (
+                        '1 pages structurally validated; run the worker dry run to verify image '
+                        'services before publication.'
+                    ),
+                    'source_url': self.ao,
+                    'status': 'Ready',
+                },
+                {
+                    'item_ids': ['sample'],
+                    'message': (
+                        '1 pages structurally validated; run the worker dry run to verify image '
+                        'services before publication.'
+                    ),
+                    'source_url': self.do,
+                    'status': 'Ready',
+                },
+            ],
         )
 
     def test_unknown_url_is_actionable(self):
