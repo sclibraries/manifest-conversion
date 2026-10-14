@@ -38,9 +38,7 @@ def encode(value):
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + '\n').encode()
 
 
-def load_json(data, limit=8 * 1024 * 1024):  # noqa: C901
-    if len(data) > limit:
-        raise ValueError('JSON byte limit exceeded')
+def _validate_json_depth(data):
     # Check nesting before invoking the recursive JSON decoder, respecting strings.
     depth = 0
     quoted = False
@@ -62,18 +60,25 @@ def load_json(data, limit=8 * 1024 * 1024):  # noqa: C901
         elif char in ']}':
             depth -= 1
 
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError('duplicate JSON key')
-            result[key] = value
-        return result
 
-    def invalid(value):
-        raise ValueError('non-finite JSON number')
+def _unique_object(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError('duplicate JSON key')
+        result[key] = value
+    return result
 
-    return json.loads(data, object_pairs_hook=pairs, parse_constant=invalid)
+
+def _reject_constant(value):
+    raise ValueError('non-finite JSON number')
+
+
+def load_json(data, limit=8 * 1024 * 1024):
+    if len(data) > limit:
+        raise ValueError('JSON byte limit exceeded')
+    _validate_json_depth(data)
+    return json.loads(data, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
 
 
 def https_url(url):
@@ -120,7 +125,7 @@ def check_fields(obj, allowed):
         raise ValueError('unsupported manifest fields; review required')
 
 
-def convert(source, canonical, image_base):  # noqa: C901, PLR0915
+def _prepare_manifest(source, canonical, image_base):
     https_url(canonical)
     https_url(image_base)
     result = copy.deepcopy(source)
@@ -145,6 +150,10 @@ def convert(source, canonical, image_base):  # noqa: C901, PLR0915
     result['@id'] = canonical
     sequence['@id'] = canonical + '/sequence/normal'
     receipt = {'pages': [], 'omitted_hocr_links': [], 'omitted_search_services': []}
+    return result, canvases, receipt
+
+
+def _omit_search_services(result, receipt):
     if 'service' in result:
         services = result['service']
         if not isinstance(services, list) or any(
@@ -153,87 +162,113 @@ def convert(source, canonical, image_base):  # noqa: C901, PLR0915
         ):
             raise ValueError('unsupported manifest service; review required')
         receipt['omitted_search_services'] = result.pop('service')
+
+
+def _canvas_identity(canvas, seen):
+    check_fields(canvas, '@id @type label width height images thumbnail metadata seeAlso')
+    identity = canvas.get('@id', '')
+    https_url(identity)
+    if identity in seen:
+        raise ValueError('duplicate canvas')
+    seen.add(identity)
+    if canvas.get('@type') != 'sc:Canvas':
+        raise ValueError('invalid canvas type')
+    for dimension in ('width', 'height'):
+        if type(canvas.get(dimension)) is not int or not 0 < canvas[dimension] <= 100000:
+            raise ValueError('invalid canvas dimensions')
+    return identity
+
+
+def _painting_resource(canvas, identity):
+    annotations = canvas.get('images', [])
+    if len(annotations) != 1:
+        raise ValueError('expected one painting per page')
+    annotation = annotations[0]
+    check_fields(annotation, '@id @type motivation resource on')
+    if annotation.get('on') != identity or annotation.get('motivation') != 'sc:painting':
+        raise ValueError('annotation target or motivation mismatch')
+    resource = annotation['resource']
+    check_fields(resource, '@id @type format width height service')
+    if resource.get('@type') != 'dctypes:Image':
+        raise ValueError('unsupported media type')
+    service = resource.get('service')
+    check_fields(service, '@id @context profile')
+    return resource, service
+
+
+def _convert_canvas_image(canvas, resource, service, image_base):
+    key = image_key(service['@id'])
+    # Same encoded-key convention as workbench_lite.manifest.build_cantaloupe_service_id.
+    target = image_base.rstrip('/') + '/' + quote(key, safe='')
+    resource.update(
+        {
+            '@id': target + '/full/full/0/default.jpg',
+            'format': 'image/jpeg',
+            'width': canvas['width'],
+            'height': canvas['height'],
+            'service': {
+                '@id': target,
+                '@context': 'http://iiif.io/api/image/2/context.json',
+                'profile': 'http://iiif.io/api/image/2/level2.json',
+            },
+        }
+    )
+    canvas['thumbnail'] = {
+        '@id': target + '/full/!300,300/0/default.jpg',
+        'format': 'image/jpeg',
+    }
+    return key, target
+
+
+def _record_omitted_hocr(canvas, identity, receipt):
+    if 'seeAlso' not in canvas:
+        return
+    link = canvas['seeAlso']
+    if not isinstance(link, dict) or link.get('format') != 'text/vnd.hocr+html':
+        raise ValueError('unsupported companion link; review required')
+    receipt['omitted_hocr_links'].append({'canvas': identity, 'source': canvas.pop('seeAlso')})
+
+
+def _convert_canvas(canvas, image_base, seen, receipt):
+    identity = _canvas_identity(canvas, seen)
+    resource, service = _painting_resource(canvas, identity)
+    key, target = _convert_canvas_image(canvas, resource, service, image_base)
+    _record_omitted_hocr(canvas, identity, receipt)
+    receipt['pages'].append(
+        {
+            'canvas': identity,
+            'image_key': key,
+            'service': target,
+            'width': canvas['width'],
+            'height': canvas['height'],
+        }
+    )
+
+
+def _inspect_metadata(value, key=''):
+    if isinstance(value, dict):
+        for nested_key, nested_value in value.items():
+            _inspect_metadata(nested_value, nested_key)
+    elif isinstance(value, list):
+        for nested_value in value:
+            _inspect_metadata(nested_value, key)
+    elif isinstance(value, str):
+        if '<' in value or '>' in value:
+            raise ValueError('markup requires metadata review')
+        if key not in ('@id', '@context', 'on', 'profile') and (
+            'javascript:' in value.lower() or 'data:' in value.lower()
+        ):
+            raise ValueError('unsafe metadata URI')
+
+
+def convert(source, canonical, image_base):
+    result, canvases, receipt = _prepare_manifest(source, canonical, image_base)
+    _omit_search_services(result, receipt)
     seen = set()
     for canvas in canvases:
-        check_fields(canvas, '@id @type label width height images thumbnail metadata seeAlso')
-        identity = canvas.get('@id', '')
-        https_url(identity)
-        if identity in seen:
-            raise ValueError('duplicate canvas')
-        seen.add(identity)
-        if canvas.get('@type') != 'sc:Canvas':
-            raise ValueError('invalid canvas type')
-        for dimension in ('width', 'height'):
-            if type(canvas.get(dimension)) is not int or not 0 < canvas[dimension] <= 100000:
-                raise ValueError('invalid canvas dimensions')
-        annotations = canvas.get('images', [])
-        if len(annotations) != 1:
-            raise ValueError('expected one painting per page')
-        annotation = annotations[0]
-        check_fields(annotation, '@id @type motivation resource on')
-        if annotation.get('on') != identity or annotation.get('motivation') != 'sc:painting':
-            raise ValueError('annotation target or motivation mismatch')
-        resource = annotation['resource']
-        check_fields(resource, '@id @type format width height service')
-        if resource.get('@type') != 'dctypes:Image':
-            raise ValueError('unsupported media type')
-        service = resource.get('service')
-        check_fields(service, '@id @context profile')
-        key = image_key(service['@id'])
-        # Same encoded-key convention as workbench_lite.manifest.build_cantaloupe_service_id.
-        target = image_base.rstrip('/') + '/' + quote(key, safe='')
-        resource.update(
-            {
-                '@id': target + '/full/full/0/default.jpg',
-                'format': 'image/jpeg',
-                'width': canvas['width'],
-                'height': canvas['height'],
-                'service': {
-                    '@id': target,
-                    '@context': 'http://iiif.io/api/image/2/context.json',
-                    'profile': 'http://iiif.io/api/image/2/level2.json',
-                },
-            }
-        )
-        canvas['thumbnail'] = {
-            '@id': target + '/full/!300,300/0/default.jpg',
-            'format': 'image/jpeg',
-        }
-        if 'seeAlso' in canvas:
-            link = canvas['seeAlso']
-            if not isinstance(link, dict) or link.get('format') != 'text/vnd.hocr+html':
-                raise ValueError('unsupported companion link; review required')
-            receipt['omitted_hocr_links'].append(
-                {'canvas': identity, 'source': canvas.pop('seeAlso')}
-            )
-        receipt['pages'].append(
-            {
-                'canvas': identity,
-                'image_key': key,
-                'service': target,
-                'width': canvas['width'],
-                'height': canvas['height'],
-            }
-        )
+        _convert_canvas(canvas, image_base, seen, receipt)
     result['thumbnail'] = canvases[0]['thumbnail']
-
-    # Metadata is text, never trusted HTML. Reject markup rather than silently altering it.
-    def inspect(value, key=''):
-        if isinstance(value, dict):
-            for k, v in value.items():
-                inspect(v, k)
-        elif isinstance(value, list):
-            for v in value:
-                inspect(v, key)
-        elif isinstance(value, str):
-            if '<' in value or '>' in value:
-                raise ValueError('markup requires metadata review')
-            if key not in ('@id', '@context', 'on', 'profile') and (
-                'javascript:' in value.lower() or 'data:' in value.lower()
-            ):
-                raise ValueError('unsafe metadata URI')
-
-    inspect(result)
+    _inspect_metadata(result)
     if 'logo' in result:
         raise ValueError('logo delivery requires explicit review')
     return result, receipt
