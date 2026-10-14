@@ -1,4 +1,5 @@
 import copy
+import pwd
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -420,10 +421,57 @@ class CommandTests(unittest.TestCase):
 
         with patch('scripts.manifest_worker.__main__.Fetcher', return_value=FakeFetcher()):
             self.assertEqual(main(['--config', str(config_path), '--jobs', str(job)]), 1)
-        report = next((self.root / 'state/reports').glob('*.json'))
+        reports = self.root / 'state/reports'
+        report = next(reports.glob('*.json'))
         rows = load_json(report.read_bytes())
-        self.assertEqual([row['status'] for row in rows], ['validated', 'failed'])
-        self.assertTrue(rows[0]['submitter'])
+        submitter = pwd.getpwuid(job.stat().st_uid).pw_name
+        job_hash = digest(job.read_bytes())
+        self.assertEqual(
+            rows,
+            [
+                {
+                    'item_id': 'sample',
+                    'status': 'validated',
+                    'manifest_url': BASE + '/sample.json',
+                    'aspace_record': '',
+                    'original_uri': SOURCE,
+                    'sha256': 'a570d4ac9b57c242e66804dfc130c3ea7aefc948730848ad8e005e75d6ee62a2',
+                    'submitter': submitter,
+                    'job_sha256': job_hash,
+                    'error': '',
+                },
+                {
+                    'item_id': 'unknown',
+                    'status': 'failed',
+                    'error': 'item is not in approved inventory',
+                    'job_sha256': job_hash,
+                    'submitter': submitter,
+                },
+            ],
+        )
+        csv_reports = list(reports.glob('*.csv'))
+        self.assertEqual(len(csv_reports), 1)
+        self.assertEqual(csv_reports[0].stem, report.stem)
+        self.assertEqual(
+            csv_reports[0].read_bytes(),
+            (
+                'item_id,status,manifest_url,aspace_record,original_uri,sha256,submitter,'
+                'job_sha256,error\r\n'
+                'sample,validated,'
+                + BASE
+                + '/sample.json,,https://compass.fivecolleges.edu/node/123/manifest,'
+                'a570d4ac9b57c242e66804dfc130c3ea7aefc948730848ad8e005e75d6ee62a2,'
+                + submitter
+                + ','
+                + job_hash
+                + ',\r\n'
+                'unknown,failed,,,,,'
+                + submitter
+                + ','
+                + job_hash
+                + ',item is not in approved inventory\r\n'
+            ).encode(),
+        )
 
     def test_withdrawn_item_cannot_be_republished(self):
         run_item(self.item, self.config, True, self.fetch)
