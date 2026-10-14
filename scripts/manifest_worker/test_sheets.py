@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from .core import digest, encode
 from .sheets import main, process_queue, REQUEST_HEADERS, RESULT_HEADERS
 
 URL = 'https://archives.example.org/repositories/2/archival_objects/139132'
@@ -109,6 +110,79 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.execute()['skipped'], 1)
         self.assertEqual(self.calls, 1)
         self.assertEqual(self.sheet.requests, original)
+
+    def test_approved_item_returns_complete_inventory_record(self):
+        from .sheets import approved_item
+
+        self.assertEqual(
+            approved_item(URL, self.inventory, self.config),
+            {
+                'node_id': '80405',
+                'access': 'public',
+                'policy': 'local-test',
+                'approved_by': 'operator',
+                'source_urls': [URL],
+                'item_id': 'sample',
+            },
+        )
+
+    def test_process_queue_full_result_and_ledger_output_are_pinned(self):
+        summary = self.execute()
+        self.assertEqual(
+            summary,
+            {'processed': 1, 'skipped': 0, 'reconciled': 0, 'failed': 0, 'needs_review': 0},
+        )
+        self.assertEqual(len(self.sheet.results), 2)
+        result = self.sheet.results[1]
+        request = {
+            'request_id': 'test-001',
+            'source_url': URL,
+            'notes': 'Local dry run',
+            'ready': 'TRUE',
+            'enabled': True,
+        }
+        item = dict(self.inventory['sample'], item_id='sample')
+        operation_id = digest(
+            encode(
+                {
+                    'request': request,
+                    'item': item,
+                    'review': '',
+                    'publish': False,
+                    'config': self.config,
+                }
+            )
+        )
+        self.assertEqual(
+            result[:4],
+            [
+                'test-001',
+                URL,
+                'Validated (dry run)',
+                'https://example.org/manifests/sample.json',
+            ],
+        )
+        self.assertTrue(result[4].endswith('+00:00'))
+        self.assertEqual(
+            result[5:],
+            [
+                '2 pages validated. Manifest staged locally; URL is proposed, not published.',
+                operation_id,
+            ],
+        )
+        ledger_files = list(self.root.glob('sheet-*/*.json'))
+        self.assertEqual(len(ledger_files), 1)
+        ledger = json.loads(ledger_files[0].read_bytes())
+        self.assertEqual(
+            ledger,
+            {
+                'request': {
+                    **request,
+                },
+                'status': 'completed',
+                'result': result,
+            },
+        )
 
     def test_failed_status_write_retries_without_reconverting(self):
         self.sheet.fail = True
