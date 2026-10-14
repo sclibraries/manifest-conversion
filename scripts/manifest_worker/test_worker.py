@@ -169,6 +169,58 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse((self.root / 'published/sample.json').exists())
         self.assertTrue((self.root / 'state/artifacts/sample.json').exists())
 
+    def test_dry_run_full_receipt_and_manifest_identity_are_pinned(self):
+        result = run_item(self.item, self.config, False, self.fetch)
+        timestamp = result.pop('timestamp')
+        self.assertTrue(timestamp.endswith('+00:00'))
+        self.assertEqual(
+            result,
+            {
+                'access_policy': 'review-1',
+                'approved_by': 'collection-review',
+                'aspace_record': '',
+                'converter_version': '1',
+                'item_id': 'sample',
+                'manifest_url': BASE + '/sample.json',
+                'node_id': '123',
+                'omitted_hocr_links': [
+                    {
+                        'canvas': 'https://compass.fivecolleges.edu/node/123/canvas/1',
+                        'source': {
+                            '@id': 'https://compass.fivecolleges.edu/system/files/page.html',
+                            'format': 'text/vnd.hocr+html',
+                        },
+                    }
+                ],
+                'omitted_search_services': [],
+                'original_uri': SOURCE,
+                'pages': [
+                    {
+                        'canvas': 'https://compass.fivecolleges.edu/node/123/canvas/1',
+                        'height': 200,
+                        'image_key': '2024-09/page one.tif',
+                        'service': IMAGE + '/2024-09%2Fpage%20one.tif',
+                        'width': 100,
+                    }
+                ],
+                'publication_authorized': True,
+                'sha256': 'a570d4ac9b57c242e66804dfc130c3ea7aefc948730848ad8e005e75d6ee62a2',
+                'source_sha256': digest(self.data),
+                'source_uri': SOURCE,
+                'status': 'validated',
+            },
+        )
+        staged = load_json((self.root / 'state/artifacts/sample.json').read_bytes())
+        self.assertEqual(staged['@id'], BASE + '/sample.json')
+        self.assertEqual(
+            staged['sequences'][0]['canvases'][0]['@id'],
+            'https://compass.fivecolleges.edu/node/123/canvas/1',
+        )
+        self.assertEqual(
+            staged['sequences'][0]['canvases'][0]['images'][0]['resource']['service']['@id'],
+            IMAGE + '/2024-09%2Fpage%20one.tif',
+        )
+
     def test_discovery_validation_cannot_grant_publication_approval(self):
         item = {
             key: value
