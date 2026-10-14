@@ -22,24 +22,25 @@ def aliases(source):
     ]
 
 
-def prepare(snapshot, source_root, config, urls, approvals, existing):  # noqa: C901, PLR0915
-    """Join exact exported relationships; no guessed aliases or access policies.
-
-    records contain either item_id/source_urls or digital_object_urls. Each URL
-    is the origin-qualified record actually exported; test and production records
-    are independent evidence. sources link those Compass aliases to retained JSON.
-    """
+def _record_index(snapshot):
     records = {}
     for record in snapshot['records']:
         key = normalized_source(record['url'])
         if key in records:
             raise ValueError('Duplicate record URL in relationship export: ' + record['url'])
         records[key] = record
+    return records
+
+
+def _source_index(snapshot):
     source_index = {}
     for number, source in enumerate(snapshot['sources']):
         for url in aliases(source):
             source_index.setdefault(normalized_source(url), set()).add(number)
+    return source_index
 
+
+def _relationship_index(records):
     items = {}
     url_items = {}
     incomplete = set()
@@ -59,135 +60,207 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):  # noqa: 
             name = safe_id(target['item_id'])
             url_items.setdefault(key, set()).add(name)
             items[name]['record_urls'].add(record['url'])
+    return items, url_items, incomplete
 
+
+def _add_evidence_aliases(name, evidence, url_items):
+    for urls in ('source_urls', 'record_urls'):
+        for url in evidence[urls]:
+            key = normalized_source(url)
+            url_items.setdefault(key, set()).add(name)
+
+
+def _match_source(name, evidence, source_index, snapshot, url_items):
+    matches = set()
+    for url in evidence['source_urls']:
+        matches.update(source_index.get(normalized_source(url), set()))
+    _add_evidence_aliases(name, evidence, url_items)
+    if not matches:
+        return None, (
+            'Missing source mapping',
+            'Export the Compass alias-to-node relationship and retain its manifest.',
+        )
+    if len(matches) != 1:
+        return None, (
+            'Ambiguous source mapping',
+            'Conflicting Compass source records match this object; reconcile the export.',
+        )
+
+    source = snapshot['sources'][next(iter(matches))]
+    for url in aliases(source):
+        url_items.setdefault(normalized_source(url), set()).add(name)
+    return source, None
+
+
+def _convert_source_manifest(name, source, raw, config):
+    checksum = digest(raw)
+    if source.get('source_sha256') and checksum != source['source_sha256']:
+        raise ValueError('Retained source checksum differs from export')
+    manifest = load_json(raw)
+    node = str(source['node_id'])
+    expected_id = 'https://compass.fivecolleges.edu/node/' + node + '/manifest'
+    if manifest.get('@id') != expected_id:
+        raise ValueError('Manifest identity differs from exported Compass node')
+    identifiers = [
+        field.get('value')
+        for field in manifest.get('metadata', [])
+        if field.get('label') == 'Identifier'
+    ]
+    if identifiers and any(value != name for value in identifiers):
+        raise ValueError(
+            'Manifest Identifier disagrees with ArchivesSpace digital-object identifier'
+        )
+    sequences = manifest.get('sequences', [])
+    if len(sequences) == 1 and not sequences[0].get('canvases'):
+        raise ValueError(
+            'Compass manifest has no pages; repair or export the source before conversion'
+        )
+    _, details = convert(
+        manifest,
+        config['manifest_base'].rstrip('/') + '/' + name + '.json',
+        config['image_base'],
+    )
+    return node, checksum, details
+
+
+def _load_source_manifest(name, source, source_root, config):
+    try:
+        raw = bounded_file(contained(source_root, source['source_file']))
+    except FileNotFoundError:
+        return None, (
+            'Missing retained source',
+            'Retain the Compass manifest in source_root, then rerun intake.',
+        )
+    except (OSError, ValueError, KeyError) as error:
+        return None, ('Invalid source manifest', str(error))
+    try:
+        return _convert_source_manifest(name, source, raw, config), None
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        return None, ('Invalid source manifest', str(error))
+
+
+def _candidate_status(name, candidate, details, config):
+    if name in config.get('withdrawn_items', []):
+        return 'Withdrawn', 'Item is withdrawn; do not publish.'
+    if (
+        candidate.get('access') != 'public'
+        or not candidate.get('policy')
+        or not candidate.get('approved_by')
+    ):
+        return (
+            'Awaiting access approval',
+            'Mapping and manifest structure verified; operator public-access approval is required.',
+        )
+    message = str(len(details['pages'])) + (
+        ' pages structurally validated; run the worker dry run to verify image '
+        'services before publication.'
+    )
+    return 'Ready', message
+
+
+def _make_candidate(
+    name, evidence, source, source_data, snapshot_hash, existing, approvals, config
+):
+    node, checksum, details = source_data
+    previous = existing.get(name, {})
+    if previous and (
+        str(previous.get('node_id')) != node or previous.get('source_sha256') != checksum
+    ):
+        return None, (
+            'Inventory conflict',
+            'Existing source identity or checksum changed; review replacement before '
+            'installing inventory.',
+        )
+
+    candidate = copy.deepcopy(previous)
+    candidate.pop('intake_hold', None)
+    candidate.update(
+        node_id=node,
+        source_file=source['source_file'],
+        source_sha256=checksum,
+        source_urls=sorted(
+            set(previous.get('source_urls', []))
+            | evidence['source_urls']
+            | evidence['record_urls']
+            | set(source.get('source_urls', []))
+        ),
+        intake_snapshot_sha256=snapshot_hash,
+    )
+    candidate.setdefault('original_uri', sorted(evidence['source_urls'])[0])
+    candidate.setdefault('aspace_record', sorted(evidence['record_urls'])[0])
+    approval = approvals.get(name, {})
+    if approval:
+        for field in ('access', 'policy', 'approved_by'):
+            candidate[field] = approval.get(field, '')
+    return candidate, _candidate_status(name, candidate, details, config)
+
+
+def _prepare_item(
+    name,
+    evidence,
+    source_index,
+    snapshot,
+    source_root,
+    config,
+    existing,
+    approvals,
+    url_items,
+    snapshot_hash,
+):
+    source, outcome = _match_source(name, evidence, source_index, snapshot, url_items)
+    if outcome:
+        return None, outcome
+    source_data, outcome = _load_source_manifest(name, source, source_root, config)
+    if outcome:
+        return None, outcome
+    return _make_candidate(
+        name,
+        evidence,
+        source,
+        source_data,
+        snapshot_hash,
+        existing,
+        approvals,
+        config,
+    )
+
+
+def _prepare_items(
+    items, source_index, snapshot, source_root, config, existing, approvals, url_items
+):
     inventory = copy.deepcopy(existing)
     outcomes = {}
     snapshot_hash = digest(encode(snapshot))
     for name, evidence in sorted(items.items()):
-        matches = set()
-        for url in evidence['source_urls']:
-            matches.update(source_index.get(normalized_source(url), set()))
-            url_items.setdefault(normalized_source(url), set()).add(name)
-        for url in evidence['record_urls']:
-            url_items.setdefault(normalized_source(url), set()).add(name)
-        if not matches:
-            outcomes[name] = (
-                'Missing source mapping',
-                'Export the Compass alias-to-node relationship and retain its manifest.',
-            )
-            continue
-        if len(matches) != 1:
-            outcomes[name] = (
-                'Ambiguous source mapping',
-                'Conflicting Compass source records match this object; reconcile the export.',
-            )
-            continue
-        source = snapshot['sources'][next(iter(matches))]
-        for url in aliases(source):
-            url_items.setdefault(normalized_source(url), set()).add(name)
-        try:
-            raw = bounded_file(contained(source_root, source['source_file']))
-        except FileNotFoundError:
-            outcomes[name] = (
-                'Missing retained source',
-                'Retain the Compass manifest in source_root, then rerun intake.',
-            )
-            continue
-        except (OSError, ValueError, KeyError) as error:
-            outcomes[name] = ('Invalid source manifest', str(error))
-            continue
-        try:
-            checksum = digest(raw)
-            if source.get('source_sha256') and checksum != source['source_sha256']:
-                raise ValueError('Retained source checksum differs from export')
-            manifest = load_json(raw)
-            node = str(source['node_id'])
-            if manifest.get('@id') != 'https://compass.fivecolleges.edu/node/' + node + '/manifest':
-                raise ValueError('Manifest identity differs from exported Compass node')
-            identifiers = [
-                m.get('value')
-                for m in manifest.get('metadata', [])
-                if m.get('label') == 'Identifier'
-            ]
-            if identifiers and any(value != name for value in identifiers):
-                raise ValueError(
-                    'Manifest Identifier disagrees with ArchivesSpace digital-object identifier'
-                )
-            sequences = manifest.get('sequences', [])
-            if len(sequences) == 1 and not sequences[0].get('canvases'):
-                raise ValueError(
-                    'Compass manifest has no pages; repair or export the source before conversion'
-                )
-            _, details = convert(
-                manifest,
-                config['manifest_base'].rstrip('/') + '/' + name + '.json',
-                config['image_base'],
-            )
-        except (ValueError, KeyError, TypeError, AttributeError) as error:
-            outcomes[name] = ('Invalid source manifest', str(error))
-            continue
-        previous = existing.get(name, {})
-        if previous and (
-            str(previous.get('node_id')) != node or previous.get('source_sha256') != checksum
-        ):
-            outcomes[name] = (
-                'Inventory conflict',
-                'Existing source identity or checksum changed; review replacement before '
-                'installing inventory.',
-            )
-            continue
-        candidate = copy.deepcopy(previous)
-        candidate.pop('intake_hold', None)
-        candidate.update(
-            node_id=node,
-            source_file=source['source_file'],
-            source_sha256=checksum,
-            source_urls=sorted(
-                set(previous.get('source_urls', []))
-                | evidence['source_urls']
-                | evidence['record_urls']
-                | set(source.get('source_urls', []))
-            ),
-            intake_snapshot_sha256=snapshot_hash,
+        candidate, outcome = _prepare_item(
+            name,
+            evidence,
+            source_index,
+            snapshot,
+            source_root,
+            config,
+            existing,
+            approvals,
+            url_items,
+            snapshot_hash,
         )
-        candidate.setdefault('original_uri', sorted(evidence['source_urls'])[0])
-        candidate.setdefault('aspace_record', sorted(evidence['record_urls'])[0])
-        approval = approvals.get(name, {})
-        if approval:
-            for field in ('access', 'policy', 'approved_by'):
-                candidate[field] = approval.get(field, '')
-        inventory[name] = candidate
-        if name in config.get('withdrawn_items', []):
-            outcomes[name] = ('Withdrawn', 'Item is withdrawn; do not publish.')
-        elif (
-            candidate.get('access') != 'public'
-            or not candidate.get('policy')
-            or not candidate.get('approved_by')
-        ):
-            outcomes[name] = (
-                'Awaiting access approval',
-                'Mapping and manifest structure verified; operator public-access approval '
-                'is required.',
-            )
-        else:
-            outcomes[name] = (
-                'Ready',
-                str(len(details['pages']))
-                + ' pages structurally validated; run the worker dry run to verify image '
-                'services before publication.',
-            )
+        outcomes[name] = outcome
+        if candidate is not None:
+            inventory[name] = candidate
+    return inventory, outcomes
 
-    # A parent with missing/ambiguous children must never become a one-item alias
-    # merely because only one child survived conversion/approval checks.
-    blocked_aliases = incomplete | {key for key, names in url_items.items() if len(names) > 1}
+
+def _blocked_aliases(url_items, incomplete):
+    return incomplete | {key for key, names in url_items.items() if len(names) > 1}
+
+
+def _apply_inventory_holds(inventory, outcomes, url_items, blocked_aliases):
     for name, candidate in inventory.items():
         if name in outcomes and outcomes[name][0] not in ('Ready', 'Awaiting access approval'):
             candidate['intake_hold'] = outcomes[name][0] + ': ' + outcomes[name][1]
         known_aliases = {normalized_source(url) for url in aliases(candidate)}
         if candidate.get('original_uri'):
             known_aliases.add(normalized_source(candidate['original_uri']))
-        # Keep old unresolved holds outside this snapshot. A new complete export
-        # can clear its own holds. Include derived node URLs used by Sheets.
         previous_blocks = set(candidate.get('blocked_source_keys', [])) - set(url_items)
         candidate['blocked_source_keys'] = sorted(
             previous_blocks | (known_aliases & blocked_aliases)
@@ -203,6 +276,8 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):  # noqa: 
         ):
             candidate.pop('original_uri')
 
+
+def _build_report(urls, url_items, incomplete, outcomes):
     report = []
     for url in urls:
         try:
@@ -236,7 +311,25 @@ def prepare(snapshot, source_root, config, urls, approvals, existing):  # noqa: 
         else:
             status, message = outcomes[names[0]]
         report.append({'source_url': url, 'item_ids': names, 'status': status, 'message': message})
-    return inventory, report
+    return report
+
+
+def prepare(snapshot, source_root, config, urls, approvals, existing):
+    """Join exact exported relationships; no guessed aliases or access policies.
+
+    records contain either item_id/source_urls or digital_object_urls. Each URL
+    is the origin-qualified record actually exported; test and production records
+    are independent evidence. sources link those Compass aliases to retained JSON.
+    """
+    records = _record_index(snapshot)
+    source_index = _source_index(snapshot)
+    items, url_items, incomplete = _relationship_index(records)
+    inventory, outcomes = _prepare_items(
+        items, source_index, snapshot, source_root, config, existing, approvals, url_items
+    )
+    blocked = _blocked_aliases(url_items, incomplete)
+    _apply_inventory_holds(inventory, outcomes, url_items, blocked)
+    return inventory, _build_report(urls, url_items, incomplete, outcomes)
 
 
 def main(argv=None):
