@@ -53,8 +53,8 @@ This repository is public and dedicated to the public domain under CC0 1.0 Unive
 fixtures synthetic. Do not commit tickets, planning records, pilot/evidence logs, staff or vendor
 contact details, credentials, private hostnames, internal server paths, or production inputs.
 Use `example.org` placeholders. The public hosts `compass.fivecolleges.edu`,
-`findingaids.smith.edu`, and `digital.smith.edu` are allowed when needed by the documented
-interfaces.
+`findingaids.smith.edu`, `digital.smith.edu`, and `compass-prod-i2-files.s3.amazonaws.com`
+are allowed when needed by the documented interfaces.
 
 ## Working rules
 

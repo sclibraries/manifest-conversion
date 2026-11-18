@@ -154,6 +154,47 @@ class CoreTests(unittest.TestCase):
             },
         )
 
+    def test_conversion_keeps_stored_thumbnails_and_falls_back_for_others(self):
+        host = 'https://compass-prod-i2-files.s3.amazonaws.com'
+        source_url = host + '/s3fs-public/2024-10/example.jpg'
+        stored = {'@id': source_url, 'format': 'image/jpeg', 'width': 1, 'height': 100000}
+        cases = [
+            ('stored', stored, True),
+            ('optional dimensions', {'@id': source_url, 'format': 'image/jpeg'}, True),
+            ('no thumbnail', None, False),
+            ('thumbnail list', [stored], False),
+        ]
+        invalid = (
+            ('wrong host', '@id', 'https://images.example.org/s3fs-public/example.jpg'),
+            ('private path', '@id', host + '/s3fs-private/example.jpg'),
+            ('extra key', 'label', 'Page'),
+            ('wrong format', 'format', 'image/png'),
+            ('query string', '@id', source_url + '?size=small'),
+            ('fragment', '@id', source_url + '#thumbnail'),
+            ('zero dimension', 'width', 0),
+            ('boolean dimension', 'width', True),
+            ('oversized dimension', 'height', 100001),
+        )
+        cases.extend((name, {**stored, key: value}, False) for name, key, value in invalid)
+        fallback = {
+            '@id': IMAGE + '/2024-09%2Fpage%20one.tif/full/!300,300/0/default.jpg',
+            'format': 'image/jpeg',
+        }
+
+        for name, thumbnail, keep in cases:
+            with self.subTest(name=name):
+                source = manifest()
+                canvas = source['sequences'][0]['canvases'][0]
+                if thumbnail is not None:
+                    canvas['thumbnail'] = thumbnail
+
+                output, _ = convert(source, BASE + '/sample.json', IMAGE)
+
+                expected = thumbnail if keep else fallback
+                converted_canvas = output['sequences'][0]['canvases'][0]
+                self.assertEqual(converted_canvas['thumbnail'], expected)
+                self.assertEqual(output['thumbnail'], expected)
+
     def test_legacy_search_service_is_removed_and_recorded(self):
         source = manifest()
         source['service'] = [

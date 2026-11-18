@@ -120,6 +120,28 @@ def image_key(service):
     return key
 
 
+def _is_stored_thumbnail(thumbnail):
+    if not isinstance(thumbnail, dict) or set(thumbnail) - {'@id', 'format', 'width', 'height'}:
+        return False
+    if thumbnail.get('format') != 'image/jpeg':
+        return False
+    try:
+        parsed = https_url(thumbnail.get('@id'))
+    except ValueError:
+        return False
+    if (
+        parsed.hostname != 'compass-prod-i2-files.s3.amazonaws.com'
+        or not parsed.path.startswith('/s3fs-public/')
+        or parsed.query
+    ):
+        return False
+    return all(
+        type(thumbnail[dimension]) is int and 1 <= thumbnail[dimension] <= 100000
+        for dimension in ('width', 'height')
+        if dimension in thumbnail
+    )
+
+
 def check_fields(obj, allowed):
     if not isinstance(obj, dict) or set(obj) - set(allowed.split()):
         raise ValueError('unsupported manifest fields; review required')
@@ -213,10 +235,11 @@ def _convert_canvas_image(canvas, resource, service, image_base):
             },
         }
     )
-    canvas['thumbnail'] = {
-        '@id': target + '/full/!300,300/0/default.jpg',
-        'format': 'image/jpeg',
-    }
+    if not _is_stored_thumbnail(canvas.get('thumbnail')):
+        canvas['thumbnail'] = {
+            '@id': target + '/full/!300,300/0/default.jpg',
+            'format': 'image/jpeg',
+        }
     return key, target
 
 

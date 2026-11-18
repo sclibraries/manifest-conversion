@@ -137,7 +137,8 @@ claim to convert every Compass object.
 Known legacy hOCR seeAlso links and Compass Search API services are omitted from the
 public output and explicitly preserved in receipts/original manifests. They are not
 replaced by an unimplemented OCR endpoint. Originals are never deleted. Image metadata
-is checked; downloading every image tile/thumbnail and hosted CSP/browser verification
+is checked; stored Compass thumbnails are kept, and other thumbnails fall back to the
+image service. Downloading every image tile/thumbnail and hosted CSP/browser verification
 remain deployment acceptance tasks. Metadata is untrusted; consumers must still escape it.
 
 ## Tests
